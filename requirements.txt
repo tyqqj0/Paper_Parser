@@ -7,6 +7,8 @@ pydantic-settings==2.1.0
 # HTTP客户端
 httpx==0.25.2
 aiohttp==3.9.1
+# Semantic Scholar SDK
+semanticscholar==0.8.4
 
 # 缓存和数据库
 redis==5.0.1

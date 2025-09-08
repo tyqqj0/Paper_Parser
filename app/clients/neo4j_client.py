@@ -9,7 +9,7 @@ from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession
 from loguru import logger
 
 from app.core.config import settings
-from app.models.paper import Paper, ExternalIds
+from app.models.paper import EnhancedPaper
 
 
 class Neo4jClient:
@@ -56,8 +56,8 @@ class Neo4jClient:
             "CREATE INDEX paper_year IF NOT EXISTS FOR (p:Paper) ON (p.year)",
             
             # 外部ID索引
-            "CREATE INDEX external_doi IF NOT EXISTS FOR (e:ExternalId) ON (e.value) WHERE e.type = 'DOI'",
-            "CREATE INDEX external_arxiv IF NOT EXISTS FOR (e:ExternalId) ON (e.value) WHERE e.type = 'ArXiv'",
+            "CREATE INDEX external_doi IF NOT EXISTS FOR (e:ExternalId) ON (e.value)",
+            "CREATE INDEX external_arxiv IF NOT EXISTS FOR (e:ExternalId) ON (e.type)",
             
             # 作者索引
             "CREATE INDEX author_id IF NOT EXISTS FOR (a:Author) ON (a.authorId)",
