@@ -34,8 +34,10 @@ class RedisClient:
             logger.info("Redis连接成功")
             
         except Exception as e:
-            logger.error(f"Redis连接失败: {e}")
-            raise
+            # 降级为禁用缓存模式：不抛出异常，允许应用继续运行
+            self.redis = None
+            self._connection_pool = None
+            logger.warning(f"Redis不可用，已降级为无缓存模式: {e}")
     
     async def disconnect(self):
         """断开连接"""

@@ -54,6 +54,7 @@ class Neo4jClient:
             "CREATE INDEX corpus_id IF NOT EXISTS FOR (p:Paper) ON (p.corpusId)",
             "CREATE INDEX paper_title IF NOT EXISTS FOR (p:Paper) ON (p.title)",
             "CREATE INDEX paper_year IF NOT EXISTS FOR (p:Paper) ON (p.year)",
+            "CREATE INDEX paper_ingest_status IF NOT EXISTS FOR (p:Paper) ON (p.ingestStatus)",
             # 外部ID唯一约束（type,value）
             "CREATE CONSTRAINT external_id_unique IF NOT EXISTS FOR (e:ExternalId) REQUIRE (e.type, e.value) IS UNIQUE",
             # DataChunk 索引与唯一约束

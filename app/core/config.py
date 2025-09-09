@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     request_timeout: int = Field(default=25, alias="REQUEST_TIMEOUT")
     retry_attempts: int = Field(default=3, alias="RETRY_ATTEMPTS")
     retry_backoff: float = Field(default=2.0, alias="RETRY_BACKOFF")
+    # 关系抓取配置
+    relations_page_size: int = Field(default=200, alias="RELATIONS_PAGE_SIZE")
+    relations_full_fetch_threshold: int = Field(default=200, alias="RELATIONS_FULL_FETCH_THRESHOLD")
+    force_fetch_references: bool = Field(default=False, alias="FORCE_FETCH_REFERENCES")
+    force_fetch_citations: bool = Field(default=False, alias="FORCE_FETCH_CITATIONS")
     
     class Config:
         env_file = ".env"

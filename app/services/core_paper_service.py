@@ -25,8 +25,8 @@ class CorePaperService:
         self.neo4j = neo4j_client
         self.s2 = s2_client
         # 关系抓取策略
-        self.relations_page_size = 200
-        self.relations_full_fetch_threshold = 200
+        self.relations_page_size = int(getattr(settings, 'relations_page_size', 200) or 200)
+        self.relations_full_fetch_threshold = int(getattr(settings, 'relations_full_fetch_threshold', 200) or 200)
     
     async def get_paper(self, paper_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -561,6 +561,15 @@ class CorePaperService:
             except Exception:
                 pass
 
+            # 全局开关强制抓取（即使超过阈值）
+            try:
+                if getattr(settings, 'force_fetch_citations', False):
+                    should_fetch_citations = True
+                if getattr(settings, 'force_fetch_references', False):
+                    should_fetch_references = True
+            except Exception:
+                pass
+
             relations: Dict[str, Any] = {}
             if should_fetch_citations or should_fetch_references:
                 relations = await self._fetch_relations_segmented(
@@ -581,7 +590,7 @@ class CorePaperService:
                         return
                     await self.neo4j.merge_aliases_from_paper(data)
                     await self.neo4j.merge_data_chunks_from_full_data(data)
-                    # 在计数不大时直接合并 CITES（避免大请求卡主）
+                    # 根据是否已抓取关系决定是否立即合并 CITES，并为大规模被引创建计划
                     try:
                         c_count = int(data.get('citationCount') or 0)
                     except Exception:
@@ -590,10 +599,13 @@ class CorePaperService:
                         r_count = int(data.get('referenceCount') or 0)
                     except Exception:
                         r_count = 0
-                    if c_count <= self.relations_full_fetch_threshold or r_count <= self.relations_full_fetch_threshold:
+
+                    # 若任一关系已抓取，则直接落库对应的 CITES 边
+                    if should_fetch_citations or should_fetch_references:
                         await self.neo4j.merge_cites_from_full_data(data)
-                    else:
-                        # 为大规模 citations 生成后续分页抓取计划（占位）
+
+                    # 若被引量大且本次未抓取，则创建分页抓取计划（避免 else 误判）
+                    if (not should_fetch_citations) and c_count > self.relations_full_fetch_threshold:
                         await self.neo4j.create_citations_ingest_plan(
                             data.get('paperId'), c_count, self.relations_page_size
                         )

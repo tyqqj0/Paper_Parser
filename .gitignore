@@ -44,3 +44,19 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 app/api/v1/__pycache__/paper.cpython-310.pyc
+
+
+# 报告
+*report*.txt
+*report*.json
+*test*.txt
+*test*.json
+*test*.log
+*test*.html
+*test*.xml
+*test*.csv
+*test*.xlsx
+*test*.pdf
+*test*.docx
+*test*.doc
+*test*.pptx
