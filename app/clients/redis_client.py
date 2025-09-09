@@ -46,6 +46,9 @@ class RedisClient:
     async def get(self, key: str) -> Optional[Any]:
         """获取缓存值"""
         try:
+            if self.redis is None:
+                # 未连接时，优雅降级为未命中
+                return None
             value = await self.redis.get(key)
             if value:
                 return json.loads(value)
@@ -62,6 +65,9 @@ class RedisClient:
     ) -> bool:
         """设置缓存值"""
         try:
+            if self.redis is None:
+                # 未连接时直接返回False，不抛异常
+                return False
             json_value = json.dumps(value, ensure_ascii=False, default=str)
             if ttl:
                 result = await self.redis.setex(key, ttl, json_value)
@@ -79,6 +85,8 @@ class RedisClient:
     async def delete(self, key: str) -> bool:
         """删除缓存"""
         try:
+            if self.redis is None:
+                return False
             result = await self.redis.delete(key)
             return bool(result)
         except Exception as e:
@@ -88,6 +96,8 @@ class RedisClient:
     async def exists(self, key: str) -> bool:
         """检查键是否存在"""
         try:
+            if self.redis is None:
+                return False
             result = await self.redis.exists(key)
             return bool(result)
         except Exception as e:
@@ -97,6 +107,8 @@ class RedisClient:
     async def expire(self, key: str, ttl: int) -> bool:
         """设置过期时间"""
         try:
+            if self.redis is None:
+                return False
             result = await self.redis.expire(key, ttl)
             return bool(result)
         except Exception as e:
@@ -106,6 +118,8 @@ class RedisClient:
     async def ttl(self, key: str) -> int:
         """获取剩余过期时间"""
         try:
+            if self.redis is None:
+                return -1
             return await self.redis.ttl(key)
         except Exception as e:
             logger.error(f"Redis获取TTL失败 key={key}: {e}")
@@ -114,6 +128,8 @@ class RedisClient:
     async def mget(self, keys: List[str]) -> List[Optional[Any]]:
         """批量获取"""
         try:
+            if self.redis is None:
+                return [None] * len(keys)
             values = await self.redis.mget(keys)
             results = []
             for value in values:
@@ -129,6 +145,8 @@ class RedisClient:
     async def mset(self, mapping: Dict[str, Any], ttl: Optional[int] = None) -> bool:
         """批量设置"""
         try:
+            if self.redis is None:
+                return False
             # 转换为JSON字符串
             json_mapping = {
                 key: json.dumps(value, ensure_ascii=False, default=str)

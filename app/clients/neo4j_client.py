@@ -121,6 +121,11 @@ class Neo4jClient:
         
         async with self.driver.session() as session:
             try:
+                # 入参校验
+                if not paper_data or not isinstance(paper_data, dict):
+                    logger.error("合并论文失败：paper_data为空或类型错误")
+                    return False
+                
                 # 准备数据
                 paper_id = paper_data.get("paperId")
                 if not paper_id:
@@ -146,18 +151,23 @@ class Neo4jClient:
                 record = await result.single()
                 if record:
                     # 处理外部ID
-                    if "externalIds" in paper_data and paper_data["externalIds"]:
+                    if isinstance(paper_data.get("externalIds"), dict) and paper_data["externalIds"]:
                         await self._merge_external_ids(session, paper_id, paper_data["externalIds"])
                     
                     # 处理作者关系
-                    if "authors" in paper_data and paper_data["authors"]:
+                    if isinstance(paper_data.get("authors"), list) and paper_data["authors"]:
                         await self._merge_authors(session, paper_id, paper_data["authors"])
                     
                     return True
                 return False
                 
             except Exception as e:
-                logger.error(f"Neo4j合并论文失败 paper_id={paper_data.get('paperId')}: {e}")
+                safe_paper_id = None
+                try:
+                    safe_paper_id = paper_data.get('paperId') if isinstance(paper_data, dict) else None
+                except Exception:
+                    safe_paper_id = None
+                logger.error(f"Neo4j合并论文失败 paper_id={safe_paper_id}: {e}")
                 return False
     
     async def _merge_external_ids(self, session: AsyncSession, paper_id: str, external_ids: Dict):

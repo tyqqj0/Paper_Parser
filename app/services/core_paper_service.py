@@ -13,7 +13,8 @@ from app.core.config import settings, CacheKeys, ErrorCodes
 from app.clients.redis_client import redis_client
 from app.clients.neo4j_client import neo4j_client
 from app.clients.s2_client import s2_client
-from app.models.paper import EnhancedPaper, PaperFieldsConfig, SearchResult, BatchResult, S2ApiException
+from app.models.paper import EnhancedPaper, PaperFieldsConfig, SearchResult, BatchResult
+from app.models.exception import S2ApiException
 
 
 class CorePaperService:
@@ -73,7 +74,23 @@ class CorePaperService:
         except HTTPException:
             raise
         except S2ApiException as e:
-            raise HTTPException(status_code=500, detail=f"S2 API错误: {e.message}")
+            # 根据错误类型返回相应的HTTP状态码
+            logger.error(f"获取论文上游失败 paper_id={paper_id}: {e.error_code} - {e.message}")
+            
+            if e.error_code == ErrorCodes.NOT_FOUND:
+                raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+            elif e.error_code == ErrorCodes.S2_RATE_LIMITED:
+                raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+            elif e.error_code == ErrorCodes.TIMEOUT:
+                raise HTTPException(status_code=408, detail="请求超时")
+            elif e.error_code == ErrorCodes.S2_NETWORK_ERROR:
+                raise HTTPException(status_code=502, detail="网络连接失败")
+            elif e.error_code == ErrorCodes.S2_AUTH_ERROR:
+                raise HTTPException(status_code=401, detail="API认证失败")
+            elif e.error_code == ErrorCodes.S2_UNAVAILABLE:
+                raise HTTPException(status_code=503, detail="上游API服务不可用")
+            else:
+                raise HTTPException(status_code=500, detail=f"S2 API错误: {e.message}")
         except Exception as e:
             logger.error(f"获取论文失败 paper_id={paper_id}: {e}")
             raise HTTPException(status_code=500, detail="内部服务器错误")
@@ -95,15 +112,35 @@ class CorePaperService:
             return cached_data
         
         try:
+            # 处理fields参数 - 转换为列表格式
+            fields_list = None
+            if fields:
+                fields_list = [f.strip() for f in fields.split(',')]
+            
             # 从S2 API获取
             citations_data = await self.s2.get_paper_citations(
-                paper_id, offset, limit, fields
+                paper_id, limit, offset, fields_list
             )
             
+            # 标准化空结果，避免缓存None
+            if not citations_data:
+                citations_data = {
+                    'total': 0,
+                    'offset': offset,
+                    'data': []
+                }
+
+            # 统一输出字段
+            shaped = {
+                'total': citations_data.get('total', 0),
+                'offset': citations_data.get('offset', offset),
+                'citations': citations_data.get('data', []),
+            }
+
             # 缓存结果
-            await self.redis.set(cache_key, citations_data, settings.cache_paper_ttl)
+            await self.redis.set(cache_key, shaped, settings.cache_paper_ttl)
             
-            return citations_data
+            return shaped
             
         except S2ApiException as e:
             raise HTTPException(status_code=500, detail=f"获取引用失败: {e.message}")
@@ -125,15 +162,35 @@ class CorePaperService:
             return cached_data
         
         try:
+            # 处理fields参数 - 转换为列表格式
+            fields_list = None
+            if fields:
+                fields_list = [f.strip() for f in fields.split(',')]
+            
             # 从S2 API获取
             references_data = await self.s2.get_paper_references(
-                paper_id, offset, limit, fields
+                paper_id, limit, offset, fields_list
             )
             
+            # 标准化空结果
+            if not references_data:
+                references_data = {
+                    'total': 0,
+                    'offset': offset,
+                    'data': []
+                }
+
+            # 统一输出字段
+            shaped = {
+                'total': references_data.get('total', 0),
+                'offset': references_data.get('offset', offset),
+                'references': references_data.get('data', []),
+            }
+
             # 缓存结果
-            await self.redis.set(cache_key, references_data, settings.cache_paper_ttl)
+            await self.redis.set(cache_key, shaped, settings.cache_paper_ttl)
             
-            return references_data
+            return shaped
             
         except S2ApiException as e:
             raise HTTPException(status_code=500, detail=f"获取参考文献失败: {e.message}")
@@ -169,24 +226,68 @@ class CorePaperService:
             return cached_data
         
         try:
+            # 处理fields参数 - 转换为列表格式
+            fields_list = None
+            if fields:
+                fields_list = [f.strip() for f in fields.split(',')]
+            
+            # 处理venue和fields_of_study参数 - 转换为列表格式
+            venue_list = None
+            if venue:
+                venue_list = [v.strip() for v in venue.split(',')]
+                
+            fields_of_study_list = None
+            if fields_of_study:
+                fields_of_study_list = [f.strip() for f in fields_of_study.split(',')]
+            
             # 从S2 API搜索
             search_results = await self.s2.search_papers(
                 query=query,
                 offset=offset,
                 limit=limit,
-                fields=fields,
+                fields=fields_list,
                 year=year,
-                venue=venue,
-                fields_of_study=fields_of_study
+                venue=venue_list,
+                fields_of_study=fields_of_study_list
             )
             
+            # 标准化真正的空结果（上游成功但无数据）
+            if not search_results:
+                search_results = {
+                    'total': 0,
+                    'offset': offset,
+                    'data': []
+                }
+                logger.info(f"搜索成功但无结果 - query='{query}', offset={offset}, limit={limit}")
+
+            # 统一输出字段
+            shaped = {
+                'total': search_results.get('total', 0),
+                'offset': search_results.get('offset', offset),
+                'papers': search_results.get('data', []),
+            }
+
             # 缓存搜索结果
-            await self.redis.set(cache_key, search_results, settings.cache_search_ttl)
+            await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
             
-            return search_results
+            return shaped
             
         except S2ApiException as e:
-            raise HTTPException(status_code=500, detail=f"搜索失败: {e.message}")
+            # 根据错误类型返回相应的HTTP状态码
+            logger.error(f"搜索上游失败 - query='{query}': {e.error_code} - {e.message}")
+            
+            if e.error_code == ErrorCodes.S2_RATE_LIMITED:
+                raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+            elif e.error_code == ErrorCodes.TIMEOUT:
+                raise HTTPException(status_code=408, detail="搜索请求超时")
+            elif e.error_code == ErrorCodes.S2_NETWORK_ERROR:
+                raise HTTPException(status_code=502, detail="网络连接失败")
+            elif e.error_code == ErrorCodes.S2_AUTH_ERROR:
+                raise HTTPException(status_code=401, detail="API认证失败")
+            elif e.error_code == ErrorCodes.S2_UNAVAILABLE:
+                raise HTTPException(status_code=503, detail="上游API服务不可用")
+            else:
+                raise HTTPException(status_code=500, detail=f"搜索失败: {e.message}")
     
     async def get_papers_batch(
         self, 
@@ -212,8 +313,13 @@ class CorePaperService:
         # 2. 批量获取未缓存的数据
         if uncached_ids:
             try:
+                # 处理fields参数 - 转换为列表格式
+                fields_list = None
+                if fields:
+                    fields_list = [f.strip() for f in fields.split(',')]
+                
                 batch_ids = [pid for _, pid in uncached_ids]
-                batch_data = await self.s2.get_papers_batch(batch_ids, fields)
+                batch_data = await self.s2.get_papers_batch(batch_ids, fields_list)
                 
                 # 更新结果和缓存
                 cache_mapping = {}
@@ -233,8 +339,8 @@ class CorePaperService:
             except S2ApiException as e:
                 raise HTTPException(status_code=500, detail=f"批量获取失败: {e.message}")
         
-        # 过滤掉None值
-        return [result for result in results if result is not None]
+        # 保持与请求数量一致（即使有None）
+        return results
     
     async def clear_cache(self, paper_id: str) -> bool:
         """清除指定论文的缓存"""
@@ -265,8 +371,13 @@ class CorePaperService:
     async def warm_cache(self, paper_id: str, fields: Optional[str] = None) -> bool:
         """预热指定论文的缓存"""
         try:
+            # 处理fields参数 - 转换为列表格式
+            fields_list = None
+            if fields:
+                fields_list = [f.strip() for f in fields.split(',')]
+            
             # 强制从S2获取最新数据
-            paper_data = await self.s2.get_paper(paper_id, fields)
+            paper_data = await self.s2.get_paper(paper_id, fields_list)
             
             # 写入缓存
             await self.redis.set_paper(paper_id, paper_data, fields)
@@ -340,9 +451,18 @@ class CorePaperService:
         await self.redis.set_task_status(paper_id, "processing")
         
         try:
-            # 调用S2 API
-            s2_data = await self.s2.get_paper(paper_id, fields)
+            # 处理fields参数 - 转换为列表格式
+            fields_list = None
+            if fields:
+                fields_list = [f.strip() for f in fields.split(',')]
             
+            # 调用S2 API
+            s2_data = await self.s2.get_paper(paper_id, fields_list)
+            
+            # 如果S2返回为空，则抛404，不缓存None
+            if not s2_data:
+                raise HTTPException(status_code=404, detail="未找到论文")
+
             # 立即写入Redis缓存
             cache_key = self._get_cache_key(paper_id, fields)
             await self.redis.set(cache_key, s2_data, settings.cache_paper_ttl)

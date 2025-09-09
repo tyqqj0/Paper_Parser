@@ -4,7 +4,7 @@ Paper Parser 主应用入口
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -91,7 +91,20 @@ async def global_exception_handler(request: Request, exc: Exception):
             success=False,
             message="内部服务器错误",
             error="INTERNAL_ERROR"
-        ).__dict__
+        ).model_dump()
+    )
+
+
+# HTTP异常处理器，统一响应格式
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ApiResponse(
+            success=False,
+            message=str(exc.detail),
+            error=f"HTTP_{exc.status_code}"
+        ).model_dump()
     )
 
 

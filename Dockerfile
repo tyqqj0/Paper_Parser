@@ -46,17 +46,17 @@ COPY . .
 RUN chown -R appuser:appuser /app
 USER appuser
 
-# 设置Python路径
-ENV PYTHONPATH=/app
+# 设置Python路径（优先使用本地 vendored 的 semanticscholar 包）
+ENV PYTHONPATH=/app:/app/app/utils
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# 健康检查
+# 健康检查（与应用实际路由一致）
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/api/v1/health || exit 1
 
 # 暴露端口
 EXPOSE 8000
 
-# 启动命令
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 启动命令（强制使用 asyncio 事件循环，避免与 uvloop 的兼容问题）
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--loop", "asyncio"]

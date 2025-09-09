@@ -6,8 +6,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Union
 from dataclasses import dataclass
 from pydantic import BaseModel, Field, validator
-from semanticscholar.Paper import Paper as S2Paper
-from semanticscholar.SemanticScholarException import SemanticScholarException as S2ApiException
+from app.utils.semanticscholar.Paper import Paper as S2Paper
 
 
 class PaperFieldsConfig:
@@ -247,18 +246,16 @@ class BatchResult(BaseModel):
         )
 
 
-@dataclass
-class BatchRequest:
+class BatchRequest(BaseModel):
     """批量查询请求"""
-    paper_ids: List[str]
+    ids: List[str]
     fields: Optional[str] = None
 
 
-@dataclass
-class ApiResponse:
+class ApiResponse(BaseModel):
     """API响应格式"""
     success: bool
-    data: Optional[Dict[str, Any]] = None
+    data: Optional[Any] = None
     error: Optional[str] = None
     message: Optional[str] = None
 
@@ -270,3 +267,4 @@ class HealthCheck:
     version: Optional[str] = None
     timestamp: Optional[str] = None
     services: Optional[Dict[str, str]] = None
+    metrics: Optional[Dict[str, Any]] = None

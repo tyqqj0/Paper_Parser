@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from app.clients.s2_client import s2_client
-from app.models.paper import S2ApiException
+from app.models import S2ApiException
 from app.core.config import ErrorCodes
 
 

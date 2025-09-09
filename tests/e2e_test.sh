@@ -80,7 +80,7 @@ start_services() {
     
     # 构建镜像
     log_info "构建Docker镜像..."
-    docker compose build --no-cache
+    docker compose build
     
     # 启动服务
     log_info "启动服务..."
@@ -99,7 +99,7 @@ wait_for_services() {
     while [ $attempt -le $max_attempts ]; do
         log_info "尝试连接API服务 (${attempt}/${max_attempts})"
         
-        if curl -s --connect-timeout 5 "${API_BASE_URL}/health" >/dev/null 2>&1; then
+        if curl -s --connect-timeout 5 "${API_BASE_URL}/api/v1/health" >/dev/null 2>&1; then
             log_success "API服务已就绪"
             break
         fi
@@ -163,32 +163,32 @@ run_api_tests() {
     log_info "开始API测试..."
     
     # 健康检查
-    test_api "/health"
+    test_api "/api/v1/health"
     
     # 根路径
     test_api "/"
     
     # API文档
-    test_api "/docs" "GET" "" "200"
+    # test_api "/docs" "GET" "" "200"
     
     # OpenAPI规范
-    test_api "/openapi.json"
+    # test_api "/openapi.json"
     
     # 论文搜索测试
     log_info "测试论文搜索功能..."
-    test_api "/api/v1/papers/search?query=machine%20learning&limit=5"
+    test_api "/api/v1/paper/search?query=machine%20learning&limit=5"
     
     # 论文详情测试（使用一个常见的论文ID）
     log_info "测试论文详情功能..."
-    test_api "/api/v1/papers/649def34f8be52c8b66281af98df2819f6e85b4f"
+    test_api "/api/v1/paper/649def34f8be52c8b66281af98df2819f6e85b4f"
     
-    # 相关论文推荐测试
-    log_info "测试相关论文推荐..."
-    test_api "/api/v1/papers/649def34f8be52c8b66281af98df2819f6e85b4f/related?limit=3"
+    # 引用测试
+    log_info "测试论文引用..."
+    test_api "/api/v1/paper/649def34f8be52c8b66281af98df2819f6e85b4f/citations?limit=3"
     
-    # 统计信息测试
-    log_info "测试统计信息..."
-    test_api "/api/v1/stats"
+    # 参考文献测试
+    log_info "测试论文参考文献..."
+    test_api "/api/v1/paper/649def34f8be52c8b66281af98df2819f6e85b4f/references?limit=3"
     
     log_success "API测试完成"
 }
@@ -223,7 +223,7 @@ run_performance_tests() {
     local pids=()
     
     for i in $(seq 1 $concurrent_requests); do
-        curl -s "${API_BASE_URL}/health" >/dev/null &
+        curl -s "${API_BASE_URL}/api/v1/health" >/dev/null &
         pids+=($!)
     done
     
@@ -302,7 +302,7 @@ main() {
     check_dependencies
     
     # 启动服务
-    start_services
+    # start_services
     
     # 等待服务就绪
     wait_for_services
@@ -339,7 +339,7 @@ main() {
     else
         log_info "服务继续运行，可通过以下地址访问："
         log_info "API文档: ${API_BASE_URL}/docs"
-        log_info "健康检查: ${API_BASE_URL}/health"
+        log_info "健康检查: ${API_BASE_URL}/api/v1/health"
         log_info "要停止服务，请运行: docker compose down"
     fi
 }

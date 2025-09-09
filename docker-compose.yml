@@ -7,13 +7,21 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --save 60 1000
     restart: unless-stopped
+    # 优化内存使用
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      interval: 5s
+      timeout: 2s
+      retries: 2
+      start_period: 10s
 
   # Neo4j图数据库
   neo4j:
@@ -29,12 +37,28 @@ services:
       - NEO4J_AUTH=neo4j/password
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      # 优化Neo4j启动性能
+      - NEO4J_dbms_memory_heap_initial__size=256m
+      - NEO4J_dbms_memory_heap_max__size=512m
+      - NEO4J_dbms_memory_pagecache_size=256m
+      - NEO4J_dbms_jvm_additional=-XX:+UseG1GC -XX:+UnlockExperimentalVMOptions -XX:+UseZGC
+      - NEO4J_dbms_default__database=neo4j
     restart: unless-stopped
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '1.0'
     healthcheck:
       test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "password", "RETURN 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      interval: 15s
+      timeout: 5s
+      retries: 2
+      start_period: 60s
 
   # API服务（默认生产环境配置）
   api:

@@ -1,0 +1,87 @@
+{
+  "summary": {
+    "total": 8,
+    "passed": 1,
+    "failed": 2,
+    "warned": 5,
+    "success_rate": 12.5,
+    "duration_seconds": 30.584704399108887,
+    "timestamp": "2025-09-09T13:04:20.576399"
+  },
+  "details": [
+    {
+      "test_name": "服务健康检查",
+      "status": "PASS",
+      "timestamp": "2025-09-09T13:03:49.998816",
+      "duration": 0.007637977600097656,
+      "details": {
+        "root_status": 200,
+        "service_info": {
+          "service": "Paper Parser API",
+          "version": "0.1.0",
+          "description": "基于Semantic Scholar的学术论文缓存和代理服务",
+          "docs_url": "/docs",
+          "health_url": "/api/v1/health"
+        },
+        "response_time": "N/A"
+      },
+      "error": null
+    },
+    {
+      "test_name": "论文搜索API",
+      "status": "FAIL",
+      "timestamp": "2025-09-09T13:03:50.001725",
+      "duration": 0.0028526782989501953,
+      "details": {},
+      "error": "搜索API状态码: 500"
+    },
+    {
+      "test_name": "论文详情API",
+      "status": "WARN",
+      "timestamp": "2025-09-09T13:03:50.003852",
+      "duration": 0.0020661354064941406,
+      "details": {},
+      "error": "KeyError: 'data'"
+    },
+    {
+      "test_name": "论文引用API",
+      "status": "WARN",
+      "timestamp": "2025-09-09T13:03:50.006297",
+      "duration": 0.002405881881713867,
+      "details": {},
+      "error": "KeyError: 'data'"
+    },
+    {
+      "test_name": "论文参考文献API",
+      "status": "WARN",
+      "timestamp": "2025-09-09T13:03:50.008419",
+      "duration": 0.002080202102661133,
+      "details": {},
+      "error": "KeyError: 'data'"
+    },
+    {
+      "test_name": "批量获取论文API",
+      "status": "WARN",
+      "timestamp": "2025-09-09T13:03:50.010627",
+      "duration": 0.0021698474884033203,
+      "details": {},
+      "error": "KeyError: 'data'"
+    },
+    {
+      "test_name": "带过滤条件搜索",
+      "status": "FAIL",
+      "timestamp": "2025-09-09T13:03:50.012696",
+      "duration": 0.0020380020141601562,
+      "details": {},
+      "error": "过滤搜索API状态码: 500"
+    },
+    {
+      "test_name": "错误处理测试",
+      "status": "WARN",
+      "timestamp": "2025-09-09T13:04:20.576181",
+      "duration": 30.563453674316406,
+      "details": {},
+      "error": "TimeoutError: "
+    }
+  ]
+}
