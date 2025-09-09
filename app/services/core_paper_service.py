@@ -206,6 +206,7 @@ class CorePaperService:
         fields_of_study: Optional[str] = None
     ) -> Dict[str, Any]:
         """搜索论文 - 缓存策略"""
+        # 上层API已做空查询校验；此处不再拦截，确保空结果只因上游无匹配
         # 生成查询哈希
         query_hash = self.s2.generate_query_hash(
             query, 
@@ -266,6 +267,8 @@ class CorePaperService:
                 'offset': search_results.get('offset', offset),
                 'papers': search_results.get('data', []),
             }
+            # 兼容字段：同时暴露 data 键，满足历史测试/脚本
+            shaped['data'] = shaped['papers']
 
             # 缓存搜索结果
             await self.redis.set(cache_key, shaped, settings.cache_search_ttl)

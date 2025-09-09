@@ -2,6 +2,7 @@
 论文核心API - 实现缓存策略
 """
 from typing import Optional, List
+import re
 from fastapi import APIRouter, HTTPException, Query, Body
 from loguru import logger
 
@@ -9,6 +10,30 @@ from app.models.paper import EnhancedPaper, SearchResult, BatchRequest, ApiRespo
 from app.services.core_paper_service import core_paper_service
 
 router = APIRouter()
+
+
+async def pre_check(query: str, offset: int, limit: int, fields: Optional[str], year: Optional[str], venue: Optional[str], fields_of_study: Optional[str]):
+    """预校验"""
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="Search query cannot be empty")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="Offset cannot be negative")    
+
+def _is_valid_paper_id(paper_id: str) -> bool:
+    """校验paper_id格式: 支持 S2ID(40位hex)、DOI、ArXiv、PubMed数字ID"""
+    # Semantic Scholar ID: 40位十六进制
+    if re.fullmatch(r"[0-9a-fA-F]{40}", paper_id):
+        return True
+    # DOI: 10.xxxx/...
+    if re.fullmatch(r"10\.\d{4,9}/\S+", paper_id, flags=0):
+        return True
+    # arXiv: 1705.10311 或 arXiv:1705.10311 或带版本 v1
+    if re.fullmatch(r"(?:arXiv:)?\d{4}\.\d{4,5}(?:v\d+)?", paper_id):
+        return True
+    # PubMed: 纯数字，长度>=5
+    if re.fullmatch(r"\d{5,}", paper_id):
+        return True
+    return False
 
 
 @router.get("/search", response_model=ApiResponse)
@@ -23,6 +48,9 @@ async def search_papers(
 ):
     """搜索论文 - 实现缓存策略"""
     try:
+        # 预校验：禁止空白查询
+        await pre_check(query, offset, limit, fields, year, venue, fields_of_study)
+
         search_results = await core_paper_service.search_papers(
             query=query,
             offset=offset,
@@ -80,6 +108,9 @@ async def get_paper(
     - PubMed: 19872477
     """
     try:
+        # 提前校验paper_id格式，避免不必要的上游请求
+        if not _is_valid_paper_id(paper_id):
+            raise HTTPException(status_code=400, detail="无效的论文ID格式")
         paper_data = await core_paper_service.get_paper(paper_id, fields)
         
         return ApiResponse(success=True, data=paper_data, message="论文信息获取成功")
@@ -100,6 +131,8 @@ async def get_paper_citations(
 ):
     """获取论文引用 - 实现缓存策略"""
     try:
+        if not _is_valid_paper_id(paper_id):
+            raise HTTPException(status_code=400, detail="无效的论文ID格式")
         citations_data = await core_paper_service.get_paper_citations(
             paper_id, offset, limit, fields
         )
@@ -122,6 +155,8 @@ async def get_paper_references(
 ):
     """获取论文参考文献 - 实现缓存策略"""
     try:
+        if not _is_valid_paper_id(paper_id):
+            raise HTTPException(status_code=400, detail="无效的论文ID格式")
         references_data = await core_paper_service.get_paper_references(
             paper_id, offset, limit, fields
         )

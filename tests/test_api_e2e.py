@@ -32,6 +32,25 @@ class PaperParserAPITester:
         self.session = None
         self.results: List[TestResult] = []
     
+    def _print_preview(self, label: str, data: Any, max_chars: int = 1200):
+        """控制台打印数据预览，自动截断避免刷屏"""
+        try:
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+        except Exception:
+            text = str(data)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n... 省略 ..."
+        print(f"   {label}:\n{text}")
+
+    def _get_header(self, headers: Dict[str, Any], name: str, default: Any = None) -> Any:
+        """不区分大小写获取响应头"""
+        if not headers:
+            return default
+        for k, v in headers.items():
+            if k.lower() == name.lower():
+                return v
+        return default
+    
     async def __aenter__(self):
         """异步上下文管理器入口"""
         self.session = aiohttp.ClientSession(
@@ -75,6 +94,9 @@ class PaperParserAPITester:
             )
             
             print(f"✅ {test_name}: PASS ({duration:.2f}s)")
+            # 打印更丰富的返回预览
+            if isinstance(result, dict) and result:
+                self._print_preview("返回详情预览", result)
             
         except AssertionError as e:
             duration = time.time() - start_time
@@ -152,13 +174,22 @@ class PaperParserAPITester:
         for field in required_fields:
             assert field in first_paper, f"论文缺少必需字段: {field}"
         
-        return {
+        preview = {
             "query": "attention is all you need",
             "results_count": len(search_results["papers"]),
             "total_available": search_results["total"],
-            "first_paper_title": first_paper["title"][:50] + "..." if len(first_paper["title"]) > 50 else first_paper["title"],
-            "response_time": response["headers"].get("x-process-time", "N/A")
+            "first_paper": {
+                "paperId": first_paper.get("paperId"),
+                "title": first_paper.get("title"),
+                "year": first_paper.get("year"),
+                "authors": [a.get("name") for a in first_paper.get("authors", [])][:5]
+            },
+            "headers": {
+                "x-process-time": self._get_header(response["headers"], "x-process-time", "N/A"),
+                "x-cache": self._get_header(response["headers"], "x-cache", "N/A")
+            }
         }
+        return preview
     
     async def test_paper_detail(self):
         """测试论文详情API"""
@@ -187,11 +218,14 @@ class PaperParserAPITester:
         
         return {
             "paper_id": paper_id,
-            "title": paper_data["title"][:50] + "..." if len(paper_data["title"]) > 50 else paper_data["title"],
+            "title": paper_data.get("title"),
             "authors_count": len(paper_data.get("authors", [])),
             "year": paper_data.get("year"),
             "citation_count": paper_data.get("citationCount"),
-            "response_time": response["headers"].get("x-process-time", "N/A")
+            "headers": {
+                "x-process-time": self._get_header(response["headers"], "x-process-time", "N/A"),
+                "x-cache": self._get_header(response["headers"], "x-cache", "N/A")
+            }
         }
     
     async def test_paper_citations(self):
@@ -225,7 +259,10 @@ class PaperParserAPITester:
             "paper_id": paper_id,
             "citations_found": len(citations_data["citations"]),
             "total_citations": citations_data.get("total", 0),
-            "response_time": response["headers"].get("x-process-time", "N/A")
+            "headers": {
+                "x-process-time": self._get_header(response["headers"], "x-process-time", "N/A"),
+                "x-cache": self._get_header(response["headers"], "x-cache", "N/A")
+            }
         }
     
     async def test_paper_references(self):
@@ -259,7 +296,10 @@ class PaperParserAPITester:
             "paper_id": paper_id,
             "references_found": len(references_data["references"]),
             "total_references": references_data.get("total", 0),
-            "response_time": response["headers"].get("x-process-time", "N/A")
+            "headers": {
+                "x-process-time": self._get_header(response["headers"], "x-process-time", "N/A"),
+                "x-cache": self._get_header(response["headers"], "x-cache", "N/A")
+            }
         }
     
     async def test_batch_papers(self):
@@ -298,7 +338,10 @@ class PaperParserAPITester:
             "requested_count": len(paper_ids),
             "returned_count": len(batch_data),
             "paper_ids": paper_ids,
-            "response_time": response["headers"].get("x-process-time", "N/A")
+            "headers": {
+                "x-process-time": self._get_header(response["headers"], "x-process-time", "N/A"),
+                "x-cache": self._get_header(response["headers"], "x-cache", "N/A")
+            }
         }
     
     async def test_error_handling(self):
