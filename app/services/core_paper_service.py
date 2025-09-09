@@ -24,6 +24,9 @@ class CorePaperService:
         self.redis = redis_client
         self.neo4j = neo4j_client
         self.s2 = s2_client
+        # 关系抓取策略
+        self.relations_page_size = 200
+        self.relations_full_fetch_threshold = 200
     
     async def get_paper(self, paper_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -34,22 +37,22 @@ class CorePaperService:
         3. S2 API调用 (秒级)
         """
         try:
-            # 1. Redis缓存查询
-            cache_key = self._get_cache_key(paper_id, fields)
-            cached_data = await self.redis.get(cache_key)
+            # 1. Redis缓存查询（统一使用 full 视图键）
+            full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
+            cached_data = await self.redis.get(full_cache_key)
             
             if cached_data:
                 logger.debug(f"Redis缓存命中: {paper_id}")
-                return cached_data
+                return self._format_response(cached_data, fields)
             
-            # 2. Neo4j持久化查询
+            # 2. Neo4j持久化查询（支持 alias 识别）
             neo4j_data = await self._get_from_neo4j(paper_id)
             if neo4j_data and self._is_data_fresh(neo4j_data):
                 logger.debug(f"Neo4j数据命中: {paper_id}")
                 
                 # 异步更新Redis缓存
                 asyncio.create_task(
-                    self.redis.set_paper(paper_id, neo4j_data, fields)
+                    self.redis.set_paper(paper_id, neo4j_data, None)
                 )
                 
                 return self._format_response(neo4j_data, fields)
@@ -60,10 +63,10 @@ class CorePaperService:
                 # 等待最多3秒
                 for i in range(6):
                     await asyncio.sleep(0.5)
-                    cached_data = await self.redis.get(cache_key)
+                    cached_data = await self.redis.get(full_cache_key)
                     if cached_data:
                         logger.debug(f"等待后获取到缓存: {paper_id}")
-                        return cached_data
+                        return self._format_response(cached_data, fields)
                 
                 # 超时返回错误
                 raise HTTPException(status_code=408, detail="请求处理超时，请稍后重试")
@@ -105,7 +108,26 @@ class CorePaperService:
         """获取论文引用 - 缓存策略"""
         cache_key = f"paper:{paper_id}:citations:{offset}:{limit}:{fields or 'default'}"
         
-        # 尝试从缓存获取
+        # 优先从 full 视图裁剪，避免重复上游调用
+        try:
+            full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
+            full_cached = await self.redis.get(full_cache_key)
+            if isinstance(full_cached, dict) and isinstance(full_cached.get('citations'), list):
+                citations_list = full_cached['citations']
+                total = full_cached.get('citationCount', len(citations_list))
+                sliced = citations_list[offset: offset + limit] if offset or limit else citations_list
+                shaped = {
+                    'total': total,
+                    'offset': offset,
+                    'citations': sliced,
+                }
+                await self.redis.set(cache_key, shaped, settings.cache_paper_ttl)
+                logger.debug(f"引用从full缓存裁剪命中: {paper_id}")
+                return shaped
+        except Exception:
+            pass
+
+        # 尝试从细粒度缓存获取
         cached_data = await self.redis.get(cache_key)
         if cached_data:
             logger.debug(f"引用缓存命中: {paper_id}")
@@ -155,7 +177,26 @@ class CorePaperService:
         """获取论文参考文献 - 缓存策略"""
         cache_key = f"paper:{paper_id}:references:{offset}:{limit}:{fields or 'default'}"
         
-        # 尝试从缓存获取
+        # 优先从 full 视图裁剪
+        try:
+            full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
+            full_cached = await self.redis.get(full_cache_key)
+            if isinstance(full_cached, dict) and isinstance(full_cached.get('references'), list):
+                references_list = full_cached['references']
+                total = full_cached.get('referenceCount', len(references_list))
+                sliced = references_list[offset: offset + limit] if offset or limit else references_list
+                shaped = {
+                    'total': total,
+                    'offset': offset,
+                    'references': sliced,
+                }
+                await self.redis.set(cache_key, shaped, settings.cache_paper_ttl)
+                logger.debug(f"参考文献从full缓存裁剪命中: {paper_id}")
+                return shaped
+        except Exception:
+            pass
+
+        # 尝试从细粒度缓存获取
         cached_data = await self.redis.get(cache_key)
         if cached_data:
             logger.debug(f"参考文献缓存命中: {paper_id}")
@@ -302,12 +343,12 @@ class CorePaperService:
         uncached_ids = []
         
         # 1. 批量检查缓存
-        cache_keys = [self._get_cache_key(pid, fields) for pid in paper_ids]
+        cache_keys = [CacheKeys.PAPER_FULL.format(paper_id=pid) for pid in paper_ids]
         cached_data = await self.redis.mget(cache_keys)
         
         for i, (paper_id, cached) in enumerate(zip(paper_ids, cached_data)):
             if cached:
-                results.append(cached)
+                results.append(self._format_response(cached, fields))
                 logger.debug(f"批量缓存命中: {paper_id}")
             else:
                 results.append(None)  # 占位符
@@ -329,10 +370,11 @@ class CorePaperService:
                 for j, paper_data in enumerate(batch_data):
                     if paper_data:  # S2可能返回null
                         idx, paper_id = uncached_ids[j]
-                        results[idx] = paper_data
+                        projected = self._format_response(paper_data, fields)
+                        results[idx] = projected
                         
                         # 准备批量缓存
-                        cache_key = self._get_cache_key(paper_id, fields)
+                        cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
                         cache_mapping[cache_key] = paper_data
                 
                 # 批量写入缓存
@@ -383,7 +425,7 @@ class CorePaperService:
             paper_data = await self.s2.get_paper(paper_id, fields_list)
             
             # 写入缓存
-            await self.redis.set_paper(paper_id, paper_data, fields)
+            await self.redis.set_paper(paper_id, paper_data, None)
             
             # 异步写入Neo4j
             asyncio.create_task(self.neo4j.merge_paper(paper_data))
@@ -405,13 +447,9 @@ class CorePaperService:
     async def _get_from_neo4j(self, paper_id: str) -> Optional[Dict]:
         """从Neo4j获取数据"""
         try:
-            # 支持不同ID格式
-            if paper_id.startswith("10."):  # DOI
-                return await self.neo4j.get_paper_by_external_id("DOI", paper_id)
-            elif "/" not in paper_id and "." in paper_id:  # 可能是ArXiv
-                return await self.neo4j.get_paper_by_external_id("ArXiv", paper_id)
-            else:  # Semantic Scholar ID
-                return await self.neo4j.get_paper(paper_id)
+            # 统一通过 alias 识别优先
+            got = await self.neo4j.get_paper_by_alias(paper_id)
+            return got
         except Exception as e:
             logger.error(f"Neo4j查询失败 paper_id={paper_id}: {e}")
             return None
@@ -423,8 +461,22 @@ class CorePaperService:
             if not last_updated:
                 return False
             
+            # 支持字符串与Neo4j DateTime(JSON解包后可能为字典)
             if isinstance(last_updated, str):
                 last_updated = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+            elif isinstance(last_updated, dict):
+                # 兼容 Neo4j DateTime.toNativeTypes 的序列化: {year, month, day, hour, minute, second, nanosecond, timezone}
+                try:
+                    year = int(last_updated.get('year', 1970))
+                    month = int(last_updated.get('month', 1))
+                    day = int(last_updated.get('day', 1))
+                    hour = int(last_updated.get('hour', 0))
+                    minute = int(last_updated.get('minute', 0))
+                    second = int(last_updated.get('second', 0))
+                    # 忽略纳秒/时区，按本地时间处理
+                    last_updated = datetime(year, month, day, hour, minute, second)
+                except Exception:
+                    return False
             
             age = datetime.now() - last_updated.replace(tzinfo=None)
             return age.total_seconds() < max_age_hours * 3600
@@ -432,58 +484,193 @@ class CorePaperService:
         except Exception as e:
             logger.error(f"检查数据新鲜度失败: {e}")
             return False
-    
+
+    def _build_field_tree(self, fields: str) -> Dict[str, Dict]:
+        """将逗号分隔的字段列表构建为嵌套字段树，支持 authors.name 这类路径"""
+        field_tree: Dict[str, Dict] = {}
+        for raw in fields.split(','):
+            part = raw.strip()
+            if not part:
+                continue
+            node = field_tree
+            for token in part.split('.'):
+                node = node.setdefault(token, {})
+        return field_tree
+
+    def _project_by_field_tree(self, value: Any, tree: Dict[str, Dict]) -> Any:
+        """根据字段树对给定值进行投影（裁剪）。空树表示直接返回原值。"""
+        if not isinstance(tree, dict) or len(tree) == 0:
+            return value
+        if isinstance(value, dict):
+            projected: Dict[str, Any] = {}
+            for key, sub_tree in tree.items():
+                if key in value:
+                    projected[key] = self._project_by_field_tree(value[key], sub_tree)
+            return projected
+        if isinstance(value, list):
+            # 对列表内的字典元素递归裁剪；非字典元素原样返回
+            return [
+                self._project_by_field_tree(item, tree) if isinstance(item, dict) else item
+                for item in value
+            ]
+        # 基础类型，无法继续下钻，直接返回
+        return value
+
     def _format_response(self, data: Dict, fields: Optional[str] = None) -> Dict:
-        """格式化响应数据"""
+        """格式化响应数据，支持嵌套字段路径裁剪（如 authors.name、citations.title）。"""
         if not fields:
             return data
-        
-        # 如果指定了字段，只返回这些字段
-        field_list = [f.strip() for f in fields.split(',')]
-        filtered_data = {}
-        
-        for field in field_list:
-            if field in data:
-                filtered_data[field] = data[field]
-        
-        return filtered_data if filtered_data else data
+        try:
+            field_tree = self._build_field_tree(fields)
+            # 顶层按字段树选择
+            shaped: Dict[str, Any] = {}
+            for top_key, sub_tree in field_tree.items():
+                if top_key in data:
+                    shaped[top_key] = self._project_by_field_tree(data[top_key], sub_tree)
+            return shaped if shaped else data
+        except Exception as _:
+            # 任意裁剪异常时回退到原始数据，避免影响主流程
+            return data
     
     async def _fetch_from_s2(self, paper_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
-        """从S2 API获取数据"""
+        """从S2 API获取数据（主体全量 + 可选关系分页）"""
         # 设置处理状态
         await self.redis.set_task_status(paper_id, "processing")
         
         try:
-            # 处理fields参数 - 转换为列表格式
-            fields_list = None
-            if fields:
-                fields_list = [f.strip() for f in fields.split(',')]
-            
-            # 调用S2 API
-            s2_data = await self.s2.get_paper(paper_id, fields_list)
-            
-            # 如果S2返回为空，则抛404，不缓存None
-            if not s2_data:
+            # 1) 抓取主体（扩展级，不包含大列表）
+            body = await self._fetch_paper_body_full(paper_id)
+            if not body:
                 raise HTTPException(status_code=404, detail="未找到论文")
 
-            # 立即写入Redis缓存
-            cache_key = self._get_cache_key(paper_id, fields)
-            await self.redis.set(cache_key, s2_data, settings.cache_paper_ttl)
-            
-            # 异步写入Neo4j
-            if not fields or "paperId" in fields:  # 只有完整数据才入库
-                asyncio.create_task(self.neo4j.merge_paper(s2_data))
-            
+            # 2) 判断是否需要抓取关系
+            should_fetch_citations = False
+            should_fetch_references = False
+            if fields:
+                requested = {f.strip() for f in fields.split(',') if f.strip()}
+                if 'citations' in requested:
+                    should_fetch_citations = True
+                if 'references' in requested:
+                    should_fetch_references = True
+            # 若计数不大，也进行全量抓取以便后续直接切片
+            try:
+                if isinstance(body.get('citationCount'), int) and body['citationCount'] <= self.relations_full_fetch_threshold:
+                    should_fetch_citations = True
+                if isinstance(body.get('referenceCount'), int) and body['referenceCount'] <= self.relations_full_fetch_threshold:
+                    should_fetch_references = True
+            except Exception:
+                pass
+
+            relations: Dict[str, Any] = {}
+            if should_fetch_citations or should_fetch_references:
+                relations = await self._fetch_relations_segmented(
+                    paper_id,
+                    fetch_citations=should_fetch_citations,
+                    fetch_references=should_fetch_references
+                )
+
+            # 3) 合并并写缓存
+            full_data = {**body, **relations}
+            await self.redis.set_paper(paper_id, full_data, None)
+
+            # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
+            async def _async_neo4j_ingest(data):
+                try:
+                    ok = await self.neo4j.merge_paper(data)
+                    if not ok:
+                        return
+                    await self.neo4j.merge_aliases_from_paper(data)
+                    await self.neo4j.merge_data_chunks_from_full_data(data)
+                    # 在计数不大时直接合并 CITES（避免大请求卡主）
+                    try:
+                        c_count = int(data.get('citationCount') or 0)
+                    except Exception:
+                        c_count = 0
+                    try:
+                        r_count = int(data.get('referenceCount') or 0)
+                    except Exception:
+                        r_count = 0
+                    if c_count <= self.relations_full_fetch_threshold or r_count <= self.relations_full_fetch_threshold:
+                        await self.neo4j.merge_cites_from_full_data(data)
+                    else:
+                        # 为大规模 citations 生成后续分页抓取计划（占位）
+                        await self.neo4j.create_citations_ingest_plan(
+                            data.get('paperId'), c_count, self.relations_page_size
+                        )
+                except Exception as e:
+                    logger.error(f"异步Neo4j入库失败 paper_id={data.get('paperId')}: {e}")
+
+            asyncio.create_task(_async_neo4j_ingest(full_data))
+
             # 清除处理状态
             await self.redis.delete_task_status(paper_id)
-            
+
             logger.info(f"从S2获取数据成功: {paper_id}")
-            return s2_data
-            
-        except Exception as e:
+            return full_data if not fields else self._format_response(full_data, fields)
+        except Exception:
             # 设置失败状态
             await self.redis.set_task_status(paper_id, "failed", ttl=60)
             raise
+
+    async def _fetch_paper_body_full(self, paper_id: str) -> Optional[Dict[str, Any]]:
+        """抓取论文主体（扩展级字段，不包含大列表关系）。"""
+        try:
+            fields_list = PaperFieldsConfig.get_fields_for_level('extended')
+            # 移除关系字段，避免大列表
+            fields_list = [f for f in fields_list if not f.startswith('citations') and not f.startswith('references')]
+            return await self.s2.get_paper(paper_id, fields_list)
+        except Exception as e:
+            logger.error(f"抓取论文主体失败 paper_id={paper_id}: {e}")
+            return None
+
+    async def _fetch_relations_segmented(
+        self,
+        paper_id: str,
+        *,
+        fetch_citations: bool = True,
+        fetch_references: bool = True,
+    ) -> Dict[str, Any]:
+        """分页抓取引用与参考文献并合并。"""
+        result: Dict[str, Any] = {}
+        try:
+            if fetch_citations:
+                citations: List[Dict[str, Any]] = []
+                offset = 0
+                while True:
+                    chunk = await self.s2.get_paper_citations(
+                        paper_id,
+                        limit=self.relations_page_size,
+                        offset=offset,
+                        fields=None
+                    )
+                    data = (chunk or {}).get('data', [])
+                    citations.extend(data)
+                    total = (chunk or {}).get('total', 0)
+                    offset += self.relations_page_size
+                    if not data or len(citations) >= total:
+                        break
+                result['citations'] = citations
+
+            if fetch_references:
+                references: List[Dict[str, Any]] = []
+                offset = 0
+                while True:
+                    chunk = await self.s2.get_paper_references(
+                        paper_id,
+                        limit=self.relations_page_size,
+                        offset=offset,
+                        fields=None
+                    )
+                    data = (chunk or {}).get('data', [])
+                    references.extend(data)
+                    total = (chunk or {}).get('total', 0)
+                    offset += self.relations_page_size
+                    if not data or len(references) >= total:
+                        break
+                result['references'] = references
+        except Exception as e:
+            logger.error(f"分页抓取关系失败 paper_id={paper_id}: {e}")
+        return result
 
 
 # 全局服务实例

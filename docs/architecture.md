@@ -247,6 +247,72 @@ GET  /paper/autocomplete                  # 自动补全
 
 ## ⚙️ 核心服务设计
 
+### 设计补充：Alias统一、DataChunk基类、渐进式入库
+
+本节补充当前实现到目标模型的折中设计，确保低成本落地并可平滑演进。
+
+#### 1) Alias（外部标识）统一策略
+
+- 节点：`ExternalId:Alias { type, value }`
+- 关系：统一采用 `(:Paper)-[:HAS_EXTERNAL_ID]->(:ExternalId)`，不新增重复语义的边类型（如 `HAS_ALIAS`）。
+- type 范围：`DOI | ArXiv | CorpusId | URL | TITLE_NORM | MAG | ACL | PMID | PMCID`
+- 归一化规范：
+  - DOI：小写、去空白
+  - ArXiv：去版本后缀（v1/v2）、统一前缀格式
+  - URL：小写 host、去末尾`/`、去常见追踪参数（utm_*）
+  - TITLE_NORM：小写、去标点/空白、全角半角统一
+- 约束/索引：`(ExternalId.type, ExternalId.value)` 唯一；读取路径优先匹配精确的 ID（DOI/ArXiv/CorpusId/URL/MAG/ACL/PMID/PMCID），再尝试 TITLE_NORM。
+
+补充：输入解析支持前缀形式 `TYPE:value`（如 `DOI:10.1145/...`、`ARXIV:2106.15928`、`PMCID:2323736`）。
+
+这样可与现有实现兼容（已在用 `HAS_EXTERNAL_ID`），避免边类型膨胀；新增的 alias 类型只需扩展 `type` 值。
+
+#### 2) DataChunk 基类与三分数据
+
+- 节点：`DataChunk { paperId, chunkType, dataJson, lastUpdated }`
+- 标签：
+  - `:DataChunk:PaperMetadata   (chunkType='metadata')`
+  - `:DataChunk:PaperCitations  (chunkType='citations')`
+  - `:DataChunk:PaperReferences (chunkType='references')`
+- 关系：
+  - `(:Paper)-[:HAS_METADATA]->(:PaperMetadata)`
+  - `(:Paper)-[:HAS_CITATIONS]->(:PaperCitations)`
+  - `(:Paper)-[:HAS_REFERENCES]->(:PaperReferences)`
+- 索引/约束：`(paperId, chunkType)` 唯一；`paperId` 索引。
+- 读写：提供统一的合并/读取 helper，内部只对 `dataJson` 做整体读写，不拆字段，降低耦合与复杂度。
+
+保留 `Paper.dataJson` 作为冗余备份以便快速返回；DataChunk 便于后续离线任务逐步把 JSON 转为结构化图。
+
+#### 3) 渐进式 CITES 关系生成
+
+- 在线小规模：当 `citationCount/referenceCount <= 阈值` 时，直接异步批量 `MERGE` 邻居论文与 `CITES` 边。
+- 大规模离线：超阈值的 paper 仅写入 `DataChunk`，同时创建 `:DataChunk:IngestPlan:PaperCitationsPlan` 计划节点（`status='pending'`，`total/pageSize`），由后台任务（队列/调度）分页 `UNWIND` 合并，确保幂等（全用 `MERGE`）。
+- 幂等与性能：
+  - 采用批量参数 `UNWIND`，避免单条往返；
+  - 邻居 `Paper` 至少 `MERGE (p:Paper {paperId}) ON CREATE SET p.title=...`；
+  - 失败重试与断点可通过队列重入与基于 `(paperId, chunkType, lastUpdated)` 的对比实现。
+
+#### 4) Ingest 状态标记与节点合并
+
+- 在 `Paper` 节点上增加 `ingestStatus`：`"stub" | "full"`。
+  - stub：仅通过引用/被引邻居快速创建（只含 paperId/title）
+  - full：已通过 API 拉取过主体，`Paper.dataJson`/`PaperMetadata` 完整
+- 合并策略：统一使用 `MERGE (p:Paper {paperId})` 作为唯一主键，不做 title 合并； TITLE_NORM 仅用于 alias 命中，不做自动同名合并，避免歧义。
+
+#### 5) 接入点与职责边界
+
+- 接口层（CorePaperService）：
+  - 获取数据后：写 Redis、调用 `neo4j.merge_paper(full_data)`；
+  - 同步/异步触发：`merge_aliases_from_paper`、`merge_data_chunks`；
+  - 判断阈值，小规模触发 `merge_cites_from_chunks`，大规模投递后台。
+- Neo4j 客户端层：
+  - 封装 `merge_aliases_from_paper`（含归一化）
+  - 封装 `merge_data_chunks(paperId, ...)`（三类 chunk）
+  - 封装 `merge_cites_from_refs/citations(paperId, refs)`（批量 UNWIND）
+  - 索引/约束创建、健康检查、统计。
+
+此设计保持与现有实现完全兼容，只增加：更多 alias 类型、DataChunk 节点、ingest 状态与批量 CITES 生成的能力。短期收益：更高缓存命中与可观测性；中期收益：可平滑演进到完整图结构。
+
 ### CorePaperService
 
 ```python

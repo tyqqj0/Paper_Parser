@@ -21,7 +21,7 @@ class Settings(BaseSettings):
         alias="S2_BASE_URL"
     )
     s2_rate_limit: int = Field(default=100, alias="S2_RATE_LIMIT")
-    s2_timeout: int = Field(default=30, alias="S2_TIMEOUT")
+    s2_timeout: int = Field(default=60, alias="S2_TIMEOUT")
     
     # Redis配置
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     
     # 性能配置
     max_concurrent_requests: int = Field(default=10, alias="MAX_CONCURRENT_REQUESTS")
-    request_timeout: int = Field(default=30, alias="REQUEST_TIMEOUT")
+    request_timeout: int = Field(default=25, alias="REQUEST_TIMEOUT")
     retry_attempts: int = Field(default=3, alias="RETRY_ATTEMPTS")
     retry_backoff: float = Field(default=2.0, alias="RETRY_BACKOFF")
     
