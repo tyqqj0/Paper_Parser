@@ -6,7 +6,7 @@ import re
 from fastapi import APIRouter, HTTPException, Query, Body
 from loguru import logger
 
-from app.models.paper import EnhancedPaper, SearchResult, BatchRequest, ApiResponse
+from app.models.paper import EnhancedPaper, SearchResult, BatchRequest
 from app.services.core_paper_service import core_paper_service
 
 router = APIRouter()
@@ -35,8 +35,40 @@ def _is_valid_paper_id(paper_id: str) -> bool:
         return True
     return False
 
+# 严格前缀策略：除 40 位 S2 paperId 外，其余均需显式前缀
+_ALLOWED_ID_PREFIXES = {
+    "DOI", "ARXIV", "MAG", "ACL", "PMID", "PMCID", "CORPUSID", "CORPUS", "URL"
+}
 
-@router.get("/search", response_model=ApiResponse)
+def _validate_paper_identifier_strict(paper_id: str):
+    s = str(paper_id or "").strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="无效的论文ID格式")
+    # 允许裸 40 位十六进制（S2 paperId）
+    if re.fullmatch(r"[0-9a-fA-F]{40}", s):
+        return
+    # 其他必须带前缀
+    if ":" in s:
+        head = s.split(":", 1)[0].strip().upper()
+        if head in _ALLOWED_ID_PREFIXES:
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"未知ID前缀: {head}. 请使用以下之一: "
+                "DOI, ARXIV, MAG, ACL, PMID, PMCID, CorpusId, URL; 或提供40位S2 paperId"
+            ),
+        )
+    # 无前缀且非40位S2 ID：拒绝
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "请使用显式前缀（如 DOI:..., ARXIV:..., CorpusId:..., URL:...）或提供40位S2 paperId"
+        ),
+    )
+
+
+@router.get("/search")
 async def search_papers(
     query: str = Query(..., min_length=1, description="搜索关键词"),
     offset: int = Query(0, ge=0, description="偏移量"),
@@ -67,7 +99,7 @@ async def search_papers(
             fallback_to_s2=fallback_to_s2
         )
         
-        return ApiResponse(success=True, data=search_results, message="搜索完成")
+        return search_results
         
     except HTTPException:
         raise
@@ -76,7 +108,7 @@ async def search_papers(
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-@router.post("/batch", response_model=ApiResponse)
+@router.post("/batch")
 async def get_papers_batch(
     request: BatchRequest = Body(..., description="批量请求参数")
 ):
@@ -90,7 +122,7 @@ async def get_papers_batch(
             fields=request.fields
         )
         
-        return ApiResponse(success=True, data=batch_results, message=f"批量获取完成，共 {len(batch_results)} 篇论文")
+        return batch_results
         
     except HTTPException:
         raise
@@ -99,7 +131,7 @@ async def get_papers_batch(
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-@router.get("/{paper_id}", response_model=ApiResponse)
+@router.get("/{paper_id:path}")
 async def get_paper(
     paper_id: str,
     fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔")
@@ -114,12 +146,9 @@ async def get_paper(
     - PubMed: 19872477
     """
     try:
-        # 提前校验paper_id格式，避免不必要的上游请求
-        if not _is_valid_paper_id(paper_id):
-            raise HTTPException(status_code=400, detail="无效的论文ID格式")
+        _validate_paper_identifier_strict(paper_id)
         paper_data = await core_paper_service.get_paper(paper_id, fields)
-        
-        return ApiResponse(success=True, data=paper_data, message="论文信息获取成功")
+        return paper_data
         
     except HTTPException:
         raise
@@ -128,22 +157,27 @@ async def get_paper(
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-@router.get("/{paper_id}/citations", response_model=ApiResponse)
+@router.get("/{paper_id:path}/citations")
 async def get_paper_citations(
     paper_id: str,
     offset: int = Query(0, ge=0, description="偏移量"),
     limit: int = Query(10, ge=1, le=100, description="返回数量限制"),
     fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔")
 ):
-    """获取论文引用 - 实现缓存策略"""
+    """获取论文引用 - 实现缓存策略。对齐S2：顶层返回 {total, offset, data}。"""
     try:
-        if not _is_valid_paper_id(paper_id):
-            raise HTTPException(status_code=400, detail="无效的论文ID格式")
+        _validate_paper_identifier_strict(paper_id)
         citations_data = await core_paper_service.get_paper_citations(
             paper_id, offset, limit, fields
         )
-        
-        return ApiResponse(success=True, data=citations_data, message="引用信息获取成功")
+        # 对齐S2接口字段命名
+        if isinstance(citations_data, dict) and 'citations' in citations_data and 'data' not in citations_data:
+            citations_data = {
+                'total': citations_data.get('total', 0),
+                'offset': citations_data.get('offset', offset),
+                'data': citations_data.get('citations', [])
+            }
+        return citations_data
         
     except HTTPException:
         raise
@@ -152,22 +186,26 @@ async def get_paper_citations(
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-@router.get("/{paper_id}/references", response_model=ApiResponse)
+@router.get("/{paper_id:path}/references")
 async def get_paper_references(
     paper_id: str,
     offset: int = Query(0, ge=0, description="偏移量"),
     limit: int = Query(10, ge=1, le=100, description="返回数量限制"),
     fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔")
 ):
-    """获取论文参考文献 - 实现缓存策略"""
+    """获取论文参考文献 - 实现缓存策略。对齐S2：顶层返回 {total, offset, data}。"""
     try:
-        if not _is_valid_paper_id(paper_id):
-            raise HTTPException(status_code=400, detail="无效的论文ID格式")
+        _validate_paper_identifier_strict(paper_id)
         references_data = await core_paper_service.get_paper_references(
             paper_id, offset, limit, fields
         )
-        
-        return ApiResponse(success=True, data=references_data, message="参考文献获取成功")
+        if isinstance(references_data, dict) and 'references' in references_data and 'data' not in references_data:
+            references_data = {
+                'total': references_data.get('total', 0),
+                'offset': references_data.get('offset', offset),
+                'data': references_data.get('references', [])
+            }
+        return references_data
         
     except HTTPException:
         raise
@@ -177,29 +215,35 @@ async def get_paper_references(
 
 
 # 缓存管理API
-@router.delete("/{paper_id}/cache", response_model=ApiResponse)
+@router.delete("/{paper_id:path}/cache")
 async def clear_paper_cache(paper_id: str):
     """清除指定论文的缓存"""
     try:
+        _validate_paper_identifier_strict(paper_id)
         success = await core_paper_service.clear_cache(paper_id)
         
-        return ApiResponse(success=success, message="缓存清除成功" if success else "缓存清除失败")
+        if not success:
+            raise HTTPException(status_code=500, detail="缓存清除失败")
+        return {"success": True}
         
     except Exception as e:
         logger.error(f"清除缓存失败 paper_id={paper_id}: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-@router.post("/{paper_id}/cache/warm", response_model=ApiResponse)
+@router.post("/{paper_id:path}/cache/warm")
 async def warm_paper_cache(
     paper_id: str,
     fields: Optional[str] = Query(None, description="要预热的字段")
 ):
     """预热指定论文的缓存"""
     try:
+        _validate_paper_identifier_strict(paper_id)
         success = await core_paper_service.warm_cache(paper_id, fields)
         
-        return ApiResponse(success=success, message="缓存预热成功" if success else "缓存预热失败")
+        if not success:
+            raise HTTPException(status_code=500, detail="缓存预热失败")
+        return {"success": True}
         
     except Exception as e:
         logger.error(f"缓存预热失败 paper_id={paper_id}: {e}")

@@ -61,15 +61,15 @@ class CorePaperService:
             task_status = await self.redis.get_task_status(paper_id)
             if task_status == "processing":
                 # 等待最多3秒
-                for i in range(6):
+                for _ in range(6):
                     await asyncio.sleep(0.5)
                     cached_data = await self.redis.get(full_cache_key)
                     if cached_data:
                         logger.debug(f"等待后获取到缓存: {paper_id}")
                         return self._format_response(cached_data, fields)
-                
-                # 超时返回错误
-                raise HTTPException(status_code=408, detail="请求处理超时，请稍后重试")
+                # 若仍在processing，改为删除僵尸状态并继续走S2获取，避免返回408
+                logger.warning(f"处理状态超时，清理僵尸状态后直接抓取: {paper_id}")
+                await self.redis.delete_task_status(paper_id)
             
             # 4. 调用S2 API
             return await self._fetch_from_s2(paper_id, fields)
@@ -152,11 +152,11 @@ class CorePaperService:
                     'data': []
                 }
 
-            # 统一输出字段
+            # 统一输出字段（对齐S2：使用 data 键）
             shaped = {
                 'total': citations_data.get('total', 0),
                 'offset': citations_data.get('offset', offset),
-                'citations': citations_data.get('data', []),
+                'data': citations_data.get('data', []),
             }
 
             # 缓存结果
@@ -221,11 +221,11 @@ class CorePaperService:
                     'data': []
                 }
 
-            # 统一输出字段
+            # 统一输出字段（对齐S2：使用 data 键）
             shaped = {
                 'total': references_data.get('total', 0),
                 'offset': references_data.get('offset', offset),
-                'references': references_data.get('data', []),
+                'data': references_data.get('data', []),
             }
 
             # 缓存结果
@@ -600,11 +600,20 @@ class CorePaperService:
             return data
         try:
             field_tree = self._build_field_tree(fields)
+            # 始终包含 paperId 以对齐S2并便于调用方识别
+            if 'paperId' not in field_tree:
+                field_tree['paperId'] = {}
             # 顶层按字段树选择
             shaped: Dict[str, Any] = {}
             for top_key, sub_tree in field_tree.items():
                 if top_key in data:
                     shaped[top_key] = self._project_by_field_tree(data[top_key], sub_tree)
+            # 若请求包含关系字段但数据中缺失，返回空列表对齐S2形态
+            requested_top_keys = set(field_tree.keys())
+            if 'citations' in requested_top_keys and 'citations' not in shaped:
+                shaped['citations'] = []
+            if 'references' in requested_top_keys and 'references' not in shaped:
+                shaped['references'] = []
             return shaped if shaped else data
         except Exception as _:
             # 任意裁剪异常时回退到原始数据，避免影响主流程
@@ -614,7 +623,7 @@ class CorePaperService:
         """从S2 API获取数据（主体全量 + 可选关系分页）"""
         # 设置处理状态
         await self.redis.set_task_status(paper_id, "processing")
-        
+
         try:
             # 1) 抓取主体（扩展级，不包含大列表）
             body = await self._fetch_paper_body_full(paper_id)
@@ -692,15 +701,28 @@ class CorePaperService:
 
             asyncio.create_task(_async_neo4j_ingest(full_data))
 
-            # 清除处理状态
-            await self.redis.delete_task_status(paper_id)
-
             logger.info(f"从S2获取数据成功: {paper_id}")
             return full_data if not fields else self._format_response(full_data, fields)
+        except HTTPException:
+            # 标记失败，避免遗留processing状态导致后续408
+            try:
+                await self.redis.set_task_status(paper_id, "failed", ttl=60)
+            except Exception:
+                pass
+            raise
         except Exception:
             # 设置失败状态
-            await self.redis.set_task_status(paper_id, "failed", ttl=60)
+            try:
+                await self.redis.set_task_status(paper_id, "failed", ttl=60)
+            except Exception:
+                pass
             raise
+        finally:
+            # 无论成功或失败都清理处理状态，避免僵尸状态
+            try:
+                await self.redis.delete_task_status(paper_id)
+            except Exception:
+                pass
 
     async def _fetch_paper_body_full(self, paper_id: str) -> Optional[Dict[str, Any]]:
         """抓取论文主体（扩展级字段，不包含大列表关系）。"""

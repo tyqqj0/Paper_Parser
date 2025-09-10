@@ -226,12 +226,12 @@ class E2ETestSuite:
         alias_tests = [
             {
                 "name": "ArXiv ID查询", 
-                "alias": "1706.03762",  # Attention Is All You Need的ArXiv ID
+                "alias": "ARXIV:1706.03762",  # Attention Is All You Need的ArXiv ID
                 "expected_title_contains": "Attention"
             },
             {
                 "name": "DOI查询",
-                "alias": "10.18653/v1/N16-1030",  # 一个已知DOI
+                "alias": "DOI:10.18653/v1/N16-1030",  # 一个已知DOI
                 "expected_title_contains": ""  # 不强制要求特定标题
             }
         ]

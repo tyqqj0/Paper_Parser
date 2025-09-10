@@ -16,7 +16,7 @@ from app.clients.redis_client import redis_client
 from app.clients.neo4j_client import neo4j_client
 from app.clients.s2_client import s2_client
 from app.api.v1 import api_router
-from app.models.paper import ApiResponse
+from app.models.paper import HealthCheck
 
 
 # 配置日志
@@ -82,30 +82,17 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # 全局异常处理器
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """全局异常处理"""
+    """全局异常处理 - 返回S2风格错误"""
     logger.error(f"未处理的异常: {type(exc).__name__}: {str(exc)}")
-    
-    return JSONResponse(
-        status_code=500,
-        content=ApiResponse(
-            success=False,
-            message="内部服务器错误",
-            error="INTERNAL_ERROR"
-        ).model_dump()
-    )
+    return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
 
 
 # HTTP异常处理器，统一响应格式
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=ApiResponse(
-            success=False,
-            message=str(exc.detail),
-            error=f"HTTP_{exc.status_code}"
-        ).model_dump()
-    )
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    # 与S2保持一致: 仅返回 {"error": message}
+    return JSONResponse(status_code=exc.status_code, content={"error": detail})
 
 
 # 请求日志中间件
@@ -140,20 +127,16 @@ app.include_router(api_router, prefix=settings.api_prefix)
 
 
 # 根路径
-@app.get("/", response_model=ApiResponse)
+@app.get("/")
 async def root():
     """根路径 - 服务信息"""
-    return ApiResponse(
-        success=True,
-        data={
-            "service": "Paper Parser API",
-            "version": "0.1.0",
-            "description": "基于Semantic Scholar的学术论文缓存和代理服务",
-            "docs_url": "/docs",
-            "health_url": f"{settings.api_prefix}/health"
-        },
-        message="服务运行正常"
-    )
+    return {
+        "service": "Paper Parser API",
+        "version": "0.1.0",
+        "description": "基于Semantic Scholar的学术论文缓存和代理服务",
+        "docs_url": "/docs",
+        "health_url": f"{settings.api_prefix}/health"
+    }
 
 
 if __name__ == "__main__":

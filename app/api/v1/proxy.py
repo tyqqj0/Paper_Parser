@@ -5,7 +5,7 @@ from typing import Optional, Any, Dict
 from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 
-from app.models.paper import ApiResponse
+# 代理路由直接返回S2原始响应
 from app.services.proxy_service import proxy_service
 
 router = APIRouter()
@@ -55,7 +55,7 @@ async def proxy_request(
 
 
 # 特殊代理路由 - 作者相关
-@router.get("/author/{author_id}", response_model=ApiResponse)
+@router.get("/author/{author_id}")
 async def get_author(
     author_id: str,
     fields: Optional[str] = None
@@ -72,11 +72,7 @@ async def get_author(
             params=params
         )
         
-        return ApiResponse(
-            success=True,
-            data=result,
-            message="作者信息获取成功"
-        )
+        return result
         
     except HTTPException:
         raise
