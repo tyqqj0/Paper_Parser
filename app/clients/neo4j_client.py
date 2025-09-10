@@ -76,6 +76,8 @@ class Neo4jClient:
     
     async def get_paper(self, paper_id: str) -> Optional[Dict]:
         """根据paperId获取论文"""
+        if self.driver is None:
+            return None
         query = """
         MATCH (p:Paper {paperId: $paper_id})
         RETURN p
@@ -106,6 +108,8 @@ class Neo4jClient:
     
     async def get_paper_by_external_id(self, id_type: str, id_value: str) -> Optional[Dict]:
         """根据外部ID获取论文"""
+        if self.driver is None:
+            return None
         query = """
         MATCH (p:Paper)-[:HAS_EXTERNAL_ID]->(e:ExternalId {type: $id_type, value: $id_value})
         RETURN p
@@ -147,6 +151,8 @@ class Neo4jClient:
         - TITLE_NORM（强匹配，不做模糊）
         """
         try:
+            if self.driver is None:
+                return None
             s = (raw_identifier or "").strip()
             if not s:
                 return None
@@ -281,6 +287,8 @@ class Neo4jClient:
         说明：TITLE_NORM 为归一化小写、去符号、压缩空格后的强匹配键，适用于 contains 匹配。
         """
         try:
+            if self.driver is None:
+                return []
             if not title_fragment or not isinstance(title_fragment, str):
                 return []
             norm = self._normalize_title_norm(title_fragment)
@@ -317,6 +325,8 @@ class Neo4jClient:
     
     async def merge_paper(self, paper_data: Dict) -> bool:
         """插入或更新论文数据"""
+        if self.driver is None:
+            return False
         query = """
         MERGE (p:Paper {paperId: $paper_id})
         SET p += $properties,
@@ -470,6 +480,8 @@ class Neo4jClient:
         支持类型：DOI/ArXiv/CorpusId/URL/TITLE_NORM/MAG/ACL/PMID/PMCID
         """
         try:
+            if self.driver is None:
+                return False
             paper_id = paper_data.get("paperId")
             if not paper_id:
                 return False
@@ -564,6 +576,8 @@ class Neo4jClient:
     async def merge_data_chunks_from_full_data(self, paper_data: Dict) -> bool:
         """为给定论文写入三类 DataChunk（metadata/citations/references）。"""
         try:
+            if self.driver is None:
+                return False
             paper_id = paper_data.get("paperId")
             if not paper_id:
                 return False
@@ -625,6 +639,8 @@ class Neo4jClient:
     async def merge_cites_from_full_data(self, paper_data: Dict) -> bool:
         """根据 full_data 中的 citations/references 批量创建 CITES 关系与 stub 邻居。"""
         try:
+            if self.driver is None:
+                return False
             paper_id = paper_data.get("paperId")
             if not paper_id:
                 return False
@@ -677,6 +693,8 @@ class Neo4jClient:
     async def create_citations_ingest_plan(self, paper_id: str, total: int, page_size: int) -> bool:
         """为超大规模被引创建分页抓取计划节点（占位，供后续后台任务消费）。"""
         try:
+            if self.driver is None:
+                return False
             cypher = """
             MATCH (p:Paper {paperId: $paper_id})
             MERGE (plan:DataChunk:IngestPlan:PaperCitationsPlan {paperId: $paper_id, chunkType: 'citations_plan'})
@@ -777,6 +795,8 @@ class Neo4jClient:
     
     async def create_citation_relation(self, citing_paper_id: str, cited_paper_id: str) -> bool:
         """创建引用关系"""
+        if self.driver is None:
+            return False
         query = """
         MATCH (citing:Paper {paperId: $citing_paper_id})
         MATCH (cited:Paper {paperId: $cited_paper_id})
@@ -797,6 +817,8 @@ class Neo4jClient:
     
     async def get_citations(self, paper_id: str, limit: int = 100) -> List[Dict]:
         """获取论文的引用文献"""
+        if self.driver is None:
+            return []
         query = """
         MATCH (p:Paper {paperId: $paper_id})<-[:CITES]-(citing:Paper)
         RETURN citing
@@ -817,6 +839,8 @@ class Neo4jClient:
     
     async def get_references(self, paper_id: str, limit: int = 100) -> List[Dict]:
         """获取论文的参考文献"""
+        if self.driver is None:
+            return []
         query = """
         MATCH (p:Paper {paperId: $paper_id})-[:CITES]->(referenced:Paper)
         RETURN referenced
@@ -842,6 +866,8 @@ class Neo4jClient:
         offset: int = 0
     ) -> List[Dict]:
         """搜索论文"""
+        if self.driver is None:
+            return []
         cypher_query = """
         CALL db.index.fulltext.queryNodes('paperFulltext', $query)
         YIELD node, score

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.core.config import settings
+from app.clients.neo4j_client import neo4j_client
 
 
 @pytest.fixture(scope="session")
@@ -44,6 +45,31 @@ async def async_client(test_app) -> AsyncGenerator[AsyncClient, None]:
         base_url=f"http://testserver{settings.api_prefix}"
     ) as client:
         yield client
+
+
+@pytest_asyncio.fixture(scope="session")
+async def neo4j_session():
+    """可选的 Neo4j 连接，会话级共享。
+
+    启用方式：设置环境变量 ENABLE_NEO4J_TEST=1。
+    仅在测试显式依赖该 fixture 时才会尝试连接。
+    若会话中已由其他途径建立连接（例如使用了 TestClient 触发 lifespan），则复用现有连接。
+    """
+    if os.getenv("ENABLE_NEO4J_TEST") != "1":
+        pytest.skip("ENABLE_NEO4J_TEST not set - skipping neo4j-dependent tests")
+
+    created_here = False
+    try:
+        if neo4j_client.driver is None:
+            await neo4j_client.connect()
+            created_here = True
+        yield neo4j_client
+    finally:
+        if created_here:
+            try:
+                await neo4j_client.disconnect()
+            except Exception:
+                pass
 
 
 @pytest.fixture(scope="session")
@@ -118,6 +144,14 @@ def requires_s2_key(func):
     return pytest.mark.skipif(
         not os.getenv("S2_API_KEY"),
         reason="S2_API_KEY not set"
+    )(func)
+
+
+def requires_neo4j(func):
+    """需要 Neo4j 连接的测试装饰器（通过 ENABLE_NEO4J_TEST 控制）。"""
+    return pytest.mark.skipif(
+        os.getenv("ENABLE_NEO4J_TEST") != "1",
+        reason="ENABLE_NEO4J_TEST not set"
     )(func)
 
 

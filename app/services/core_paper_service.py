@@ -672,6 +672,10 @@ class CorePaperService:
             # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
             async def _async_neo4j_ingest(data):
                 try:
+                    # 未连接Neo4j时静默跳过
+                    if getattr(self.neo4j, "driver", None) is None:
+                        logger.info("Neo4j未连接，跳过异步入库")
+                        return
                     ok = await self.neo4j.merge_paper(data)
                     if not ok:
                         return

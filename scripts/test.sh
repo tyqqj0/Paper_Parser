@@ -128,6 +128,7 @@ show_help() {
     echo ""
     echo "环境变量:"
     echo "  S2_API_KEY    Semantic Scholar API Key（在线测试需要）"
+    echo "  ENABLE_NEO4J_TEST    Neo4j测试开关（需要Neo4j连接）"
     echo ""
     echo "示例:"
     echo "  $0 all                    # 运行所有测试"
@@ -200,6 +201,8 @@ main() {
             ;;
     esac
 }
+
+export ENABLE_NEO4J_TEST=1
 
 # 运行主函数
 main "$@"
