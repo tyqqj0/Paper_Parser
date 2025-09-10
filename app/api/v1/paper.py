@@ -44,7 +44,10 @@ async def search_papers(
     fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔"),
     year: Optional[str] = Query(None, description="发表年份，如：2020 或 2018-2020"),
     venue: Optional[str] = Query(None, description="发表场所"),
-    fields_of_study: Optional[str] = Query(None, description="研究领域")
+    fields_of_study: Optional[str] = Query(None, description="研究领域"),
+    match_title: bool = Query(False, description="启用标题精准匹配模式（仅返回最佳1条）"),
+    prefer_local: bool = Query(True, description="本地优先：先查Neo4j，未命中再走S2"),
+    fallback_to_s2: bool = Query(True, description="未命中本地时是否回退调用S2")
 ):
     """搜索论文 - 实现缓存策略"""
     try:
@@ -58,7 +61,10 @@ async def search_papers(
             fields=fields,
             year=year,
             venue=venue,
-            fields_of_study=fields_of_study
+            fields_of_study=fields_of_study,
+            match_title=match_title,
+            prefer_local=prefer_local,
+            fallback_to_s2=fallback_to_s2
         )
         
         return ApiResponse(success=True, data=search_results, message="搜索完成")

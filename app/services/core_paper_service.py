@@ -244,7 +244,11 @@ class CorePaperService:
         fields: Optional[str] = None,
         year: Optional[str] = None,
         venue: Optional[str] = None,
-        fields_of_study: Optional[str] = None
+        fields_of_study: Optional[str] = None,
+        *,
+        match_title: bool = False,
+        prefer_local: bool = True,
+        fallback_to_s2: bool = True,
     ) -> Dict[str, Any]:
         """搜索论文 - 缓存策略"""
         # 上层API已做空查询校验；此处不再拦截，确保空结果只因上游无匹配
@@ -256,7 +260,10 @@ class CorePaperService:
             fields=fields,
             year=year,
             venue=venue,
-            fields_of_study=fields_of_study
+            fields_of_study=fields_of_study,
+            match_title=match_title,
+            prefer_local=prefer_local,
+            fallback_to_s2=fallback_to_s2,
         )
         
         cache_key = CacheKeys.SEARCH_QUERY.format(query_hash=query_hash)
@@ -281,6 +288,77 @@ class CorePaperService:
             fields_of_study_list = None
             if fields_of_study:
                 fields_of_study_list = [f.strip() for f in fields_of_study.split(',')]
+            
+            # 标题精准匹配模式（最多返回1条）
+            if match_title:
+                # 1) 本地优先：exact alias 命中
+                if prefer_local:
+                    try:
+                        local_exact = await self.neo4j.get_paper_by_alias(query)
+                    except Exception:
+                        local_exact = None
+                    if local_exact:
+                        projected = self._format_response(local_exact, fields) if fields else local_exact
+                        shaped = {
+                            'total': 1,
+                            'offset': 0,
+                            'papers': [projected],
+                        }
+                        shaped['data'] = shaped['papers']
+                        await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
+                        return shaped
+
+                    # 2) 本地 contains 命中（TITLE_NORM）
+                    try:
+                        candidates = await self.neo4j.find_papers_by_title_norm_contains(query, limit=3)
+                    except Exception:
+                        candidates = []
+                    if candidates:
+                        top = candidates[0]
+                        projected = self._format_response(top, fields) if fields else top
+                        shaped = {
+                            'total': 1,
+                            'offset': 0,
+                            'papers': [projected],
+                        }
+                        shaped['data'] = shaped['papers']
+                        await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
+                        return shaped
+
+                # 3) 未命中且允许回退到S2精准匹配
+                if fallback_to_s2:
+                    search_results = await self.s2.search_papers(
+                        query=query,
+                        offset=0,
+                        limit=1,
+                        fields=fields_list,
+                        year=None,
+                        venue=None,
+                        fields_of_study=None,
+                        match_title=True,
+                    )
+                else:
+                    search_results = {
+                        'total': 0,
+                        'offset': 0,
+                        'data': []
+                    }
+
+                if not search_results:
+                    search_results = {
+                        'total': 0,
+                        'offset': 0,
+                        'data': []
+                    }
+
+                shaped = {
+                    'total': search_results.get('total', 0),
+                    'offset': 0,
+                    'papers': search_results.get('data', [])[:1],
+                }
+                shaped['data'] = shaped['papers']
+                await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
+                return shaped
             
             # 从S2 API搜索
             search_results = await self.s2.search_papers(

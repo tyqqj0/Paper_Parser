@@ -275,6 +275,46 @@ class Neo4jClient:
             logger.error(f"根据别名获取论文失败 id={raw_identifier}: {e}")
         return None
     
+    async def find_papers_by_title_norm_contains(self, title_fragment: str, limit: int = 3) -> List[Dict]:
+        """按 TITLE_NORM contains/prefix 做轻量模糊匹配，返回若干候选。
+
+        说明：TITLE_NORM 为归一化小写、去符号、压缩空格后的强匹配键，适用于 contains 匹配。
+        """
+        try:
+            if not title_fragment or not isinstance(title_fragment, str):
+                return []
+            norm = self._normalize_title_norm(title_fragment)
+            if not norm:
+                return []
+            cypher = """
+            MATCH (p:Paper)-[:HAS_EXTERNAL_ID]->(e:ExternalId {type: 'TITLE_NORM'})
+            WHERE e.value CONTAINS $needle OR e.value STARTS WITH $needle
+            RETURN p
+            LIMIT $limit
+            """
+            async with self.driver.session(database=settings.neo4j_database) as session:
+                result = await session.run(cypher, needle=norm, limit=int(limit or 3))
+                hits: List[Dict] = []
+                async for record in result:
+                    node = record.get("p")
+                    if node:
+                        props = dict(node)
+                        data_json = props.get("dataJson")
+                        if isinstance(data_json, str) and data_json:
+                            try:
+                                payload = json.loads(data_json)
+                                if props.get("lastUpdated") is not None:
+                                    payload["lastUpdated"] = props.get("lastUpdated")
+                                hits.append(payload)
+                                continue
+                            except Exception:
+                                pass
+                        hits.append(props)
+                return hits
+        except Exception as e:
+            logger.error(f"TITLE_NORM contains 匹配失败 fragment='{title_fragment}': {e}")
+            return []
+    
     async def merge_paper(self, paper_data: Dict) -> bool:
         """插入或更新论文数据"""
         query = """

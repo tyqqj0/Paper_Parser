@@ -61,7 +61,10 @@ class S2SDKClient:
         fields: Optional[str] = None,
         year: Optional[str] = None,
         venue: Optional[str] = None,
-        fields_of_study: Optional[str] = None
+        fields_of_study: Optional[str] = None,
+        match_title: bool = False,
+        prefer_local: bool = True,
+        fallback_to_s2: bool = True,
     ) -> str:
         """生成稳定的搜索查询哈希，用于缓存键。
 
@@ -75,6 +78,9 @@ class S2SDKClient:
             'year': str(year) if year else None,
             'venue': ','.join(sorted([v.strip() for v in venue.split(',')])) if venue else None,
             'fields_of_study': ','.join(sorted([f.strip() for f in fields_of_study.split(',')])) if fields_of_study else None,
+            'match_title': bool(match_title),
+            'prefer_local': bool(prefer_local),
+            'fallback_to_s2': bool(fallback_to_s2),
         }
         payload = json.dumps(normalized, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
         return hashlib.sha256(payload.encode('utf-8')).hexdigest()
@@ -154,7 +160,8 @@ class S2SDKClient:
         fields: Optional[List[str]] = None,
         year: Optional[str] = None,
         venue: Optional[List[str]] = None,
-        fields_of_study: Optional[List[str]] = None
+        fields_of_study: Optional[List[str]] = None,
+        match_title: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         搜索论文
@@ -183,6 +190,27 @@ class S2SDKClient:
             
             logger.debug(f"[S2 DEBUG] 使用字段: {fields}")
             
+            # 标题精准匹配模式：返回最佳1条
+            if match_title:
+                logger.info(f"[S2 API] 调用精准匹配接口 - query='{query}'")
+                paper = await self.client.search_paper(
+                    query=query,
+                    limit=1,
+                    fields=fields,
+                    match_title=True
+                )
+                if paper:
+                    return {
+                        'total': 1,
+                        'offset': 0,
+                        'data': [paper.raw_data]
+                    }
+                return {
+                    'total': 0,
+                    'offset': 0,
+                    'data': []
+                }
+
             # SDK 不支持 offset 入参，使用分页+本地切片实现
             needed_count = max(0, offset) + max(0, limit)
             page_size = min(100, max(1, needed_count))  # search 接口单页上限 100
