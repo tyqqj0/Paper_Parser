@@ -357,9 +357,50 @@ class CorePaperService:
                     'papers': search_results.get('data', [])[:1],
                 }
                 shaped['data'] = shaped['papers']
+
+                # 异步触发按paper端点逻辑的全量抓取与入库，避免部分字段不一致
+                try:
+                    top_items = shaped.get('papers') or []
+                    for item in top_items:
+                        if isinstance(item, dict) and item.get('paperId'):
+                            asyncio.create_task(self._fetch_from_s2(item.get('paperId'), None))
+                except Exception:
+                    pass
+
                 await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
                 return shaped
             
+            # prefer_local：优先使用本地Neo4j全文索引
+            if prefer_local:
+                try:
+                    local_hits = await self.neo4j.search_papers(query=query, limit=limit, offset=offset)
+                except Exception:
+                    local_hits = []
+                if local_hits:
+                    try:
+                        projected_local = [self._format_response(hit, fields) if fields else hit for hit in local_hits]
+                    except Exception:
+                        projected_local = local_hits
+                    shaped_local = {
+                        'total': len(projected_local),
+                        'offset': offset,
+                        'papers': projected_local,
+                    }
+                    shaped_local['data'] = shaped_local['papers']
+                    await self.redis.set(cache_key, shaped_local, settings.cache_search_ttl)
+                    return shaped_local
+
+                # 若本地未命中且不允许回退，则直接返回空结果
+                if not fallback_to_s2:
+                    empty_shaped = {
+                        'total': 0,
+                        'offset': offset,
+                        'papers': [],
+                    }
+                    empty_shaped['data'] = empty_shaped['papers']
+                    await self.redis.set(cache_key, empty_shaped, settings.cache_search_ttl)
+                    return empty_shaped
+
             # 从S2 API搜索
             search_results = await self.s2.search_papers(
                 query=query,
@@ -391,7 +432,16 @@ class CorePaperService:
 
             # 缓存搜索结果
             await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
-            
+
+            # 异步触发按paper端点逻辑的全量抓取与入库（限制前3条），提高一致性
+            try:
+                candidates = shaped.get('papers') or []
+                for item in candidates[: min(len(candidates), 3)]:
+                    if isinstance(item, dict) and item.get('paperId'):
+                        asyncio.create_task(self._fetch_from_s2(item.get('paperId'), None))
+            except Exception:
+                pass
+
             return shaped
             
         except S2ApiException as e:

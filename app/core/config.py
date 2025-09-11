@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     force_fetch_references: bool = Field(default=False, alias="FORCE_FETCH_REFERENCES")
     force_fetch_citations: bool = Field(default=False, alias="FORCE_FETCH_CITATIONS")
     
+    # 搜索后台入库配置
+    enable_search_background_ingest: bool = Field(
+        default=True, alias="ENABLE_SEARCH_BACKGROUND_INGEST"
+    )
+    search_background_ingest_top_n: int = Field(
+        default=3, alias="SEARCH_BACKGROUND_INGEST_TOP_N"
+    )
+    search_background_ingest_delay_step_ms: int = Field(
+        default=150, alias="SEARCH_BACKGROUND_INGEST_DELAY_STEP_MS"
+    )
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

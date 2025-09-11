@@ -94,6 +94,26 @@ class RedisClient:
         except Exception as e:
             logger.error(f"Redis删除失败 key={key}: {e}")
             return False
+
+    async def delete_by_pattern(self, pattern: str) -> int:
+        """按模式删除缓存键，返回删除数量。"""
+        try:
+            if self.redis is None:
+                return 0
+            total_deleted = 0
+            keys_batch: list[str] = []
+            # scan_iter 是异步生成器
+            async for key in self.redis.scan_iter(match=pattern, count=500):
+                keys_batch.append(key)
+                if len(keys_batch) >= 500:
+                    total_deleted += int(await self.redis.delete(*keys_batch))
+                    keys_batch.clear()
+            if keys_batch:
+                total_deleted += int(await self.redis.delete(*keys_batch))
+            return total_deleted
+        except Exception as e:
+            logger.error(f"Redis按模式删除失败 pattern={pattern}: {e}")
+            return 0
     
     async def exists(self, key: str) -> bool:
         """检查键是否存在"""
