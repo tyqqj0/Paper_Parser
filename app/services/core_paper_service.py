@@ -628,7 +628,7 @@ class CorePaperService:
             # 1) 抓取主体（扩展级，不包含大列表）
             body = await self._fetch_paper_body_full(paper_id)
             if not body:
-                raise HTTPException(status_code=404, detail="未找到论文")
+                raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
 
             # 2) 判断是否需要抓取关系
             should_fetch_citations = False

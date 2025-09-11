@@ -140,7 +140,7 @@ async def autocomplete_papers(
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-# 精确匹配API
+# 精确匹配API（若需本地优先+S2回退的增强版，请使用 `/paper/search/match`）
 @router.get("/paper/search/match")
 async def match_paper(
     query: str,

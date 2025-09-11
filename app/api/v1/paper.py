@@ -131,30 +131,57 @@ async def get_papers_batch(
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 
-@router.get("/{paper_id:path}")
-async def get_paper(
-    paper_id: str,
-    fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔")
+@router.get("/search/match")
+async def match_paper_title(
+    query: str = Query(..., min_length=1, description="论文标题（将执行最相近匹配）"),
+    fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔"),
+    prefer_local: bool = Query(True, description="本地优先：先查Neo4j，未命中再走S2"),
+    fallback_to_s2: bool = Query(True, description="未命中本地时是否回退调用S2")
 ):
     """
-    获取论文详情 - 核心API，实现三级缓存
-    
-    支持的paper_id格式：
-    - Semantic Scholar ID: 649def34f8be52c8b66281af98ae884c09aef38b
-    - DOI: 10.1038/nature14539
-    - ArXiv: 1705.10311
-    - PubMed: 19872477
+    标题精准匹配（/paper/search/match）
+    - 流程：本地精确/模糊命中其一 → 直接返回；否则可回退到S2的 match 接口。
+    - 语义对齐S2：未命中返回404("Title match not found")；命中仅返回最优1条。
+    - 返回形态对齐S2：顶层 {total, offset, data:[paper]}。
     """
     try:
-        _validate_paper_identifier_strict(paper_id)
-        paper_data = await core_paper_service.get_paper(paper_id, fields)
-        return paper_data
-        
+        # 仅用于参数校验；limit固定1
+        await pre_check(query, 0, 1, fields, None, None, None)
+
+        search_results = await core_paper_service.search_papers(
+            query=query,
+            offset=0,
+            limit=1,
+            fields=fields,
+            match_title=True,
+            prefer_local=prefer_local,
+            fallback_to_s2=fallback_to_s2
+        )
+
+        papers = []
+        try:
+            papers = search_results.get('data') or search_results.get('papers') or []
+        except Exception:
+            papers = []
+
+        if not papers:
+            raise HTTPException(status_code=404, detail="Title match not found")
+
+        return {
+            'total': 1,
+            'offset': 0,
+            'data': [papers[0]]
+        }
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取论文失败 paper_id={paper_id}: {e}")
+        logger.error(f"标题精准匹配失败 query={query}: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
+
+
+## 注意：为确保更具体的路径（如 /citations, /references, /cache）优先匹配，
+## 将通配的详情路由放在文件末尾注册。
 
 
 @router.get("/{paper_id:path}/citations")
@@ -225,7 +252,9 @@ async def clear_paper_cache(paper_id: str):
         if not success:
             raise HTTPException(status_code=500, detail="缓存清除失败")
         return {"success": True}
-        
+    except HTTPException:
+        # 直接透传，例如无效ID应返回400
+        raise
     except Exception as e:
         logger.error(f"清除缓存失败 paper_id={paper_id}: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
@@ -244,7 +273,34 @@ async def warm_paper_cache(
         if not success:
             raise HTTPException(status_code=500, detail="缓存预热失败")
         return {"success": True}
-        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"缓存预热失败 paper_id={paper_id}: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
+
+
+# 通配的详情路由放在文件末尾，避免与更具体的子路径冲突
+@router.get("/{paper_id:path}")
+async def get_paper(
+    paper_id: str,
+    fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔")
+):
+    """
+    获取论文详情 - 核心API，实现三级缓存
+    
+    支持的paper_id格式：
+    - Semantic Scholar ID: 649def34f8be52c8b66281af98ae884c09aef38b
+    - DOI: 10.1038/nature14539
+    - ArXiv: 1705.10311
+    - PubMed: 19872477
+    """
+    try:
+        _validate_paper_identifier_strict(paper_id)
+        paper_data = await core_paper_service.get_paper(paper_id, fields)
+        return paper_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取论文失败 paper_id={paper_id}: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
