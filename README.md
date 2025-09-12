@@ -71,8 +71,11 @@ make dev-full
 # 启动基础环境
 docker-compose --profile dev up -d
 
-# 启动完整环境
+# 启动完整环境（包含 Celery）
 docker-compose --profile dev --profile celery up -d
+
+# 启动 ARQ 轻量队列（可选，与 Celery 并行或替代）
+docker-compose --profile arq up -d arq-worker
 ```
 
 ### 4. 验证服务
@@ -83,6 +86,7 @@ docker-compose --profile dev --profile celery up -d
 - **健康检查**: http://localhost:8000/api/v1/health
 - **Neo4j 控制台**: http://localhost:7474 (neo4j/password)
 - **Celery 监控**: http://localhost:5555 (如果启用)
+- **ARQ Worker**: 使用 `docker-compose --profile arq up -d arq-worker` 启动
 
 ## 📚 API 使用示例
 
@@ -180,6 +184,10 @@ NEO4J_PASSWORD=password
 API_HOST=0.0.0.0
 API_PORT=8000
 LOG_LEVEL=INFO
+
+# 搜索后台入库（命中缓存时后台刷新Top N条）
+ENABLE_SEARCH_BACKGROUND_INGEST=true
+SEARCH_BACKGROUND_INGEST_TOP_N=3
 ```
 
 ## 🧪 测试

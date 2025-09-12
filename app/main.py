@@ -17,6 +17,7 @@ from app.clients.neo4j_client import neo4j_client
 from app.clients.s2_client import s2_client
 from app.api.v1 import api_router
 from app.models.paper import HealthCheck
+from app.tasks.queue import task_queue
 
 
 # 配置日志
@@ -39,6 +40,8 @@ async def lifespan(app: FastAPI):
         await redis_client.connect()
         await neo4j_client.connect()
         # S2 SDK客户端在初始化时就已经准备就绪，不需要connect
+        # 连接任务队列（若不可用将自动降级）
+        await task_queue.connect()
         
         logger.info("所有服务连接成功")
         
@@ -53,6 +56,7 @@ async def lifespan(app: FastAPI):
     await redis_client.disconnect()
     await neo4j_client.disconnect()
     await s2_client.disconnect()
+    await task_queue.disconnect()
     logger.info("所有服务连接已关闭")
 
 

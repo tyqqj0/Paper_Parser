@@ -15,6 +15,7 @@ from app.clients.neo4j_client import neo4j_client
 from app.clients.s2_client import s2_client
 from app.models.paper import EnhancedPaper, PaperFieldsConfig, SearchResult, BatchResult
 from app.models.exception import S2ApiException
+from app.tasks.queue import task_queue
 
 
 class CorePaperService:
@@ -50,10 +51,13 @@ class CorePaperService:
             if neo4j_data and self._is_data_fresh(neo4j_data):
                 logger.debug(f"Neo4j数据命中: {paper_id}")
                 
-                # 异步更新Redis缓存
-                asyncio.create_task(
-                    self.redis.set_paper(paper_id, neo4j_data, None)
-                )
+                # 异步更新Redis缓存（优先入队，失败则本地任务降级）
+                try:
+                    enq_ok = await task_queue.enqueue_set_paper_cache(paper_id, neo4j_data, None)
+                except Exception:
+                    enq_ok = False
+                if not enq_ok:
+                    asyncio.create_task(self.redis.set_paper(paper_id, neo4j_data, None))
                 
                 return self._format_response(neo4j_data, fields)
             
@@ -272,6 +276,20 @@ class CorePaperService:
         cached_data = await self.redis.get(cache_key)
         if cached_data:
             logger.debug(f"搜索缓存命中: {query}")
+            # 条件刷新：当缓存存在时，选取前 N 个 paperId 进行后台刷新
+            try:
+                if getattr(settings, 'enable_search_background_ingest', True):
+                    top_n = max(0, int(getattr(settings, 'search_background_ingest_top_n', 3) or 0))
+                    if top_n > 0:
+                        items = (cached_data.get('papers') or [])
+                        for item in items[: min(len(items), top_n)]:
+                            if isinstance(item, dict) and item.get('paperId'):
+                                pid = item.get('paperId')
+                                enq_ok = await task_queue.enqueue_fetch_from_s2(pid, None)
+                                if not enq_ok:
+                                    asyncio.create_task(self._fetch_from_s2(pid, None))
+            except Exception:
+                pass
             return cached_data
         
         try:
@@ -363,7 +381,10 @@ class CorePaperService:
                     top_items = shaped.get('papers') or []
                     for item in top_items:
                         if isinstance(item, dict) and item.get('paperId'):
-                            asyncio.create_task(self._fetch_from_s2(item.get('paperId'), None))
+                            pid = item.get('paperId')
+                            enq_ok = await task_queue.enqueue_fetch_from_s2(pid, None)
+                            if not enq_ok:
+                                asyncio.create_task(self._fetch_from_s2(pid, None))
                 except Exception:
                     pass
 
@@ -438,7 +459,10 @@ class CorePaperService:
                 candidates = shaped.get('papers') or []
                 for item in candidates[: min(len(candidates), 3)]:
                     if isinstance(item, dict) and item.get('paperId'):
-                        asyncio.create_task(self._fetch_from_s2(item.get('paperId'), None))
+                        pid = item.get('paperId')
+                        enq_ok = await task_queue.enqueue_fetch_from_s2(pid, None)
+                        if not enq_ok:
+                            asyncio.create_task(self._fetch_from_s2(pid, None))
             except Exception:
                 pass
 
@@ -555,8 +579,13 @@ class CorePaperService:
             # 写入缓存
             await self.redis.set_paper(paper_id, paper_data, None)
             
-            # 异步写入Neo4j
-            asyncio.create_task(self.neo4j.merge_paper(paper_data))
+            # 异步写入Neo4j（优先入队）
+            try:
+                enq_ok = await task_queue.enqueue_neo4j_merge(paper_data)
+            except Exception:
+                enq_ok = False
+            if not enq_ok:
+                asyncio.create_task(self.neo4j.merge_paper(paper_data))
             
             logger.info(f"缓存预热成功: {paper_id}")
             return True
@@ -753,7 +782,13 @@ class CorePaperService:
                 except Exception as e:
                     logger.error(f"异步Neo4j入库失败 paper_id={data.get('paperId')}: {e}")
 
-            asyncio.create_task(_async_neo4j_ingest(full_data))
+            # 入队后台 Neo4j 入库，失败则回退本地任务
+            try:
+                enq_ok = await task_queue.enqueue_neo4j_merge(full_data)
+            except Exception:
+                enq_ok = False
+            if not enq_ok:
+                asyncio.create_task(_async_neo4j_ingest(full_data))
 
             logger.info(f"从S2获取数据成功: {paper_id}")
             return full_data if not fields else self._format_response(full_data, fields)
