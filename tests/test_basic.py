@@ -22,8 +22,9 @@ async def test_root_endpoint(client):
     assert response.status_code == 200
     
     data = response.json()
-    assert data["success"] is True
-    assert "Paper Parser API" in data["data"]["service"]
+    assert data["service"] == "Paper Parser API"
+    assert data["version"] == "0.1.0"
+    assert "description" in data
 
 
 @pytest.mark.asyncio
@@ -33,8 +34,8 @@ async def test_health_endpoint(client):
     assert response.status_code == 200
     
     data = response.json()
-    assert data["success"] is True
-    assert data["data"]["status"] == "healthy"
+    assert data["status"] == "healthy"
+    assert data["version"] == "0.1.0"
 
 
 @pytest.mark.asyncio
@@ -45,12 +46,12 @@ async def test_health_detailed_endpoint(client):
     # 由于测试环境可能没有真实的数据库连接，状态码可能不是200
     # 但应该有响应结构
     data = response.json()
-    assert "success" in data
-    assert "data" in data
+    assert "status" in data
+    assert "version" in data
     
     if response.status_code == 200:
-        assert data["data"]["status"] in ["healthy", "degraded"]
-        assert "services" in data["data"]
+        assert data["status"] in ["healthy", "degraded"]
+        assert "services" in data
 
 
 @pytest.mark.asyncio
@@ -60,7 +61,7 @@ async def test_paper_endpoint_validation():
         # 测试无效的paper_id
         response = await client.get("/api/v1/paper/invalid-id")
         # 由于没有真实的S2连接，预期会有错误
-        assert response.status_code in [404, 500]
+        assert response.status_code == 400  # 无效ID应该返回400 Bad Request
 
 
 @pytest.mark.asyncio  

@@ -40,11 +40,34 @@ async def async_client(test_app) -> AsyncGenerator[AsyncClient, None]:
     """异步测试客户端"""
     from httpx import ASGITransport
     
+    # 手动触发lifespan事件以确保Redis等服务正确初始化
+    from app.clients.redis_client import redis_client
+    from app.clients.neo4j_client import neo4j_client
+    from app.tasks.queue import task_queue
+    
+    # 启动服务（类似lifespan startup）
+    try:
+        await redis_client.connect()
+        await neo4j_client.connect() 
+        await task_queue.connect()
+    except Exception as e:
+        # 允许测试在服务不可用时继续，但记录警告
+        import logging
+        logging.warning(f"测试环境服务初始化警告: {e}")
+    
     async with AsyncClient(
         transport=ASGITransport(app=test_app), 
         base_url=f"http://testserver{settings.api_prefix}"
     ) as client:
         yield client
+        
+    # 清理资源（类似lifespan shutdown）
+    try:
+        await redis_client.disconnect()
+        await neo4j_client.disconnect() 
+        await task_queue.disconnect()
+    except Exception:
+        pass
 
 
 @pytest_asyncio.fixture(scope="session")

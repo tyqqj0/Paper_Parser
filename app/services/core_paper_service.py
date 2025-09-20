@@ -1,8 +1,8 @@
 """
 核心论文服务 - 实现三级缓存策略
 """
-import asyncio
 import json
+import asyncio
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 
@@ -16,6 +16,7 @@ from app.clients.s2_client import s2_client
 from app.models.paper import EnhancedPaper, PaperFieldsConfig, SearchResult, BatchResult
 from app.models.exception import S2ApiException
 from app.tasks.queue import task_queue
+from app.services.external_id_mapping import external_id_mapping, ExternalIdTypes
 
 
 class CorePaperService:
@@ -25,19 +26,38 @@ class CorePaperService:
         self.redis = redis_client
         self.neo4j = neo4j_client
         self.s2 = s2_client
+        self.external_mapping = external_id_mapping
         # 关系抓取策略
         self.relations_page_size = int(getattr(settings, 'relations_page_size', 200) or 200)
         self.relations_full_fetch_threshold = int(getattr(settings, 'relations_full_fetch_threshold', 200) or 200)
     
-    async def get_paper(self, paper_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
+    async def get_paper(self, paper_id: str, fields: Optional[str] = None, disable_cache: bool = False) -> Dict[str, Any]:
         """
         获取论文信息 - 三级缓存策略
         
+        0. 外部ID映射解析（如果是带前缀的外部ID）
         1. Redis缓存查询 (毫秒级)
         2. Neo4j持久化查询 (10ms级)  
         3. S2 API调用 (秒级)
+        
+        Args:
+            paper_id: 论文ID
+            fields: 要返回的字段，逗号分隔
+            disable_cache: 是否禁用缓存，为True时直接从S2 API获取
         """
         try:
+            # 0. 处理外部ID映射
+            resolved_paper_id = await self._resolve_external_id(paper_id)
+            if resolved_paper_id != paper_id:
+                logger.debug(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
+                paper_id = resolved_paper_id
+            else:
+                logger.debug(f"未解析: {paper_id} -> {paper_id}")
+            # 如果禁用缓存，直接调用S2 API
+            if disable_cache:
+                logger.debug(f"禁用缓存，直接从S2获取: {paper_id}")
+                return await self._fetch_from_s2(paper_id, fields)
+            logger.info(f"get_paper查询: {paper_id}")
             # 1. Redis缓存查询（统一使用 full 视图键）
             full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
             cached_data = await self.redis.get(full_cache_key)
@@ -48,19 +68,14 @@ class CorePaperService:
             
             # 2. Neo4j持久化查询（支持 alias 识别）
             neo4j_data = await self._get_from_neo4j(paper_id)
-            if neo4j_data and self._is_data_fresh(neo4j_data):
+            if neo4j_data:
                 logger.debug(f"Neo4j数据命中: {paper_id}")
                 
-                # 异步更新Redis缓存（优先入队，失败则本地任务降级）
-                try:
-                    enq_ok = await task_queue.enqueue_set_paper_cache(paper_id, neo4j_data, None)
-                except Exception:
-                    enq_ok = False
-                if not enq_ok:
-                    asyncio.create_task(self.redis.set_paper(paper_id, neo4j_data, None))
+                # 异步更新Redis缓存
+                await task_queue.enqueue_set_paper_cache(paper_id, neo4j_data, None)
                 
                 return self._format_response(neo4j_data, fields)
-            
+            """
             # 3. 检查是否正在处理
             task_status = await self.redis.get_task_status(paper_id)
             if task_status == "processing":
@@ -74,7 +89,7 @@ class CorePaperService:
                 # 若仍在processing，改为删除僵尸状态并继续走S2获取，避免返回408
                 logger.warning(f"处理状态超时，清理僵尸状态后直接抓取: {paper_id}")
                 await self.redis.delete_task_status(paper_id)
-            
+            """
             # 4. 调用S2 API
             return await self._fetch_from_s2(paper_id, fields)
             
@@ -110,6 +125,12 @@ class CorePaperService:
         fields: Optional[str] = None
     ) -> Dict[str, Any]:
         """获取论文引用 - 缓存策略"""
+        # 0. 处理外部ID映射
+        resolved_paper_id = await self._resolve_external_id(paper_id)
+        if resolved_paper_id != paper_id:
+            logger.debug(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
+            paper_id = resolved_paper_id
+            
         cache_key = f"paper:{paper_id}:citations:{offset}:{limit}:{fields or 'default'}"
         
         # 优先从 full 视图裁剪，避免重复上游调用
@@ -155,7 +176,8 @@ class CorePaperService:
                     'offset': offset,
                     'data': []
                 }
-
+            else:
+                logger.info(f"S2 API获取引用: {paper_id}")
             # 统一输出字段（对齐S2：使用 data 键）
             shaped = {
                 'total': citations_data.get('total', 0),
@@ -168,8 +190,29 @@ class CorePaperService:
             
             return shaped
             
+        except HTTPException:
+            raise
         except S2ApiException as e:
-            raise HTTPException(status_code=500, detail=f"获取引用失败: {e.message}")
+            # 根据错误类型返回相应的HTTP状态码
+            logger.error(f"获取引用上游失败 paper_id={paper_id}: {e.error_code} - {e.message}")
+            
+            if e.error_code == ErrorCodes.NOT_FOUND:
+                raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+            elif e.error_code == ErrorCodes.S2_RATE_LIMITED:
+                raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+            elif e.error_code == ErrorCodes.TIMEOUT:
+                raise HTTPException(status_code=408, detail="请求超时")
+            elif e.error_code == ErrorCodes.S2_NETWORK_ERROR:
+                raise HTTPException(status_code=502, detail="网络连接失败")
+            elif e.error_code == ErrorCodes.S2_AUTH_ERROR:
+                raise HTTPException(status_code=401, detail="API认证失败")
+            elif e.error_code == ErrorCodes.S2_UNAVAILABLE:
+                raise HTTPException(status_code=503, detail="上游API服务不可用")
+            else:
+                raise HTTPException(status_code=500, detail=f"S2 API错误: {e.message}")
+        except Exception as e:
+            logger.error(f"获取引用失败 paper_id={paper_id}: {e}")
+            raise HTTPException(status_code=500, detail="内部服务器错误")
     
     async def get_paper_references(
         self, 
@@ -179,8 +222,14 @@ class CorePaperService:
         fields: Optional[str] = None
     ) -> Dict[str, Any]:
         """获取论文参考文献 - 缓存策略"""
+        # 0. 处理外部ID映射
+        resolved_paper_id = await self._resolve_external_id(paper_id)
+        if resolved_paper_id != paper_id:
+            logger.info(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
+            paper_id = resolved_paper_id
+            
         cache_key = f"paper:{paper_id}:references:{offset}:{limit}:{fields or 'default'}"
-        
+        logger.info(f"尝试参考文献缓存获取: {cache_key}")
         # 优先从 full 视图裁剪
         try:
             full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
@@ -195,7 +244,7 @@ class CorePaperService:
                     'references': sliced,
                 }
                 await self.redis.set(cache_key, shaped, settings.cache_paper_ttl)
-                logger.debug(f"参考文献从full缓存裁剪命中: {paper_id}")
+                logger.info(f"参考文献从full缓存裁剪命中: {paper_id}")
                 return shaped
         except Exception:
             pass
@@ -203,7 +252,7 @@ class CorePaperService:
         # 尝试从细粒度缓存获取
         cached_data = await self.redis.get(cache_key)
         if cached_data:
-            logger.debug(f"参考文献缓存命中: {paper_id}")
+            logger.info(f"参考文献缓存命中: {paper_id}")
             return cached_data
         
         try:
@@ -211,7 +260,24 @@ class CorePaperService:
             fields_list = None
             if fields:
                 fields_list = [f.strip() for f in fields.split(',')]
-            
+            logger.info(f"尝试参考文献Neo4j获取: {paper_id}, offset={offset}, limit={limit}")
+            # 优先尝试从 Neo4j 获取（Redis 未命中时的本地持久化回退）
+            try:
+                neo4j_refs = await self.neo4j.get_references(paper_id, limit=limit, offset=offset)
+                if isinstance(neo4j_refs, list) and len(neo4j_refs) > 0:
+                    total_refs = await self.neo4j.get_references_total(paper_id)
+                    shaped = {
+                        'total': total_refs,
+                        'offset': offset,
+                        'data': neo4j_refs,
+                    }
+                    await self.redis.set(cache_key, shaped, settings.cache_paper_ttl)
+                    logger.info(f"参考文献Neo4j命中: {paper_id}")
+                    return shaped
+            except Exception:
+                # 忽略 Neo4j 异常，继续回退到 S2
+                pass
+
             # 从S2 API获取
             references_data = await self.s2.get_paper_references(
                 paper_id, limit, offset, fields_list
@@ -237,8 +303,29 @@ class CorePaperService:
             
             return shaped
             
+        except HTTPException:
+            raise
         except S2ApiException as e:
-            raise HTTPException(status_code=500, detail=f"获取参考文献失败: {e.message}")
+            # 根据错误类型返回相应的HTTP状态码
+            logger.error(f"获取参考文献上游失败 paper_id={paper_id}: {e.error_code} - {e.message}")
+            
+            if e.error_code == ErrorCodes.NOT_FOUND:
+                raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
+            elif e.error_code == ErrorCodes.S2_RATE_LIMITED:
+                raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
+            elif e.error_code == ErrorCodes.TIMEOUT:
+                raise HTTPException(status_code=408, detail="请求超时")
+            elif e.error_code == ErrorCodes.S2_NETWORK_ERROR:
+                raise HTTPException(status_code=502, detail="网络连接失败")
+            elif e.error_code == ErrorCodes.S2_AUTH_ERROR:
+                raise HTTPException(status_code=401, detail="API认证失败")
+            elif e.error_code == ErrorCodes.S2_UNAVAILABLE:
+                raise HTTPException(status_code=503, detail="上游API服务不可用")
+            else:
+                raise HTTPException(status_code=500, detail=f"S2 API错误: {e.message}")
+        except Exception as e:
+            logger.error(f"获取参考文献失败 paper_id={paper_id}: {e}")
+            raise HTTPException(status_code=500, detail="内部服务器错误")
     
     async def search_papers(
         self,
@@ -257,6 +344,7 @@ class CorePaperService:
         """搜索论文 - 缓存策略"""
         # 上层API已做空查询校验；此处不再拦截，确保空结果只因上游无匹配
         # 生成查询哈希
+        logger.info(f"a搜索论文: {query}, offset={offset}, limit={limit}, fields={fields}, year={year}, venue={venue}, fields_of_study={fields_of_study}, match_title={match_title}, prefer_local={prefer_local}, fallback_to_s2={fallback_to_s2}")
         query_hash = self.s2.generate_query_hash(
             query, 
             offset=offset, 
@@ -275,7 +363,7 @@ class CorePaperService:
         # 尝试从缓存获取
         cached_data = await self.redis.get(cache_key)
         if cached_data:
-            logger.debug(f"搜索缓存命中: {query}")
+            logger.info(f"搜索缓存命中: {query}")
             # 条件刷新：当缓存存在时，选取前 N 个 paperId 进行后台刷新
             try:
                 if getattr(settings, 'enable_search_background_ingest', True):
@@ -285,9 +373,7 @@ class CorePaperService:
                         for item in items[: min(len(items), top_n)]:
                             if isinstance(item, dict) and item.get('paperId'):
                                 pid = item.get('paperId')
-                                enq_ok = await task_queue.enqueue_fetch_from_s2(pid, None)
-                                if not enq_ok:
-                                    asyncio.create_task(self._fetch_from_s2(pid, None))
+                                await task_queue.enqueue_fetch_from_s2(pid, None)
             except Exception:
                 pass
             return cached_data
@@ -309,31 +395,20 @@ class CorePaperService:
             
             # 标题精准匹配模式（最多返回1条）
             if match_title:
-                # 1) 本地优先：exact alias 命中
                 if prefer_local:
-                    try:
-                        local_exact = await self.neo4j.get_paper_by_alias(query)
-                    except Exception:
-                        local_exact = None
-                    if local_exact:
-                        projected = self._format_response(local_exact, fields) if fields else local_exact
-                        shaped = {
-                            'total': 1,
-                            'offset': 0,
-                            'papers': [projected],
-                        }
-                        shaped['data'] = shaped['papers']
-                        await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
-                        return shaped
-
-                    # 2) 本地 contains 命中（TITLE_NORM）
                     try:
                         candidates = await self.neo4j.find_papers_by_title_norm_contains(query, limit=3)
                     except Exception:
-                        candidates = []
+                        candidates = None
                     if candidates:
-                        top = candidates[0]
-                        projected = self._format_response(top, fields) if fields else top
+                        query = candidates[0].get("paperId")
+                    logger.info(f"a本地命中: {query}")
+                    try:
+                        projected=await self.get_paper(query, fields, disable_cache=False)
+                    except Exception:
+                        projected = None
+                    if projected:
+                        logger.info(f"标题精准匹配模式本地命中: {query}")
                         shaped = {
                             'total': 1,
                             'offset': 0,
@@ -382,9 +457,7 @@ class CorePaperService:
                     for item in top_items:
                         if isinstance(item, dict) and item.get('paperId'):
                             pid = item.get('paperId')
-                            enq_ok = await task_queue.enqueue_fetch_from_s2(pid, None)
-                            if not enq_ok:
-                                asyncio.create_task(self._fetch_from_s2(pid, None))
+                            await task_queue.enqueue_fetch_from_s2(pid, None)
                 except Exception:
                     pass
 
@@ -460,9 +533,7 @@ class CorePaperService:
                 for item in candidates[: min(len(candidates), 3)]:
                     if isinstance(item, dict) and item.get('paperId'):
                         pid = item.get('paperId')
-                        enq_ok = await task_queue.enqueue_fetch_from_s2(pid, None)
-                        if not enq_ok:
-                            asyncio.create_task(self._fetch_from_s2(pid, None))
+                        await task_queue.enqueue_fetch_from_s2(pid, None)
             except Exception:
                 pass
 
@@ -580,12 +651,7 @@ class CorePaperService:
             await self.redis.set_paper(paper_id, paper_data, None)
             
             # 异步写入Neo4j（优先入队）
-            try:
-                enq_ok = await task_queue.enqueue_neo4j_merge(paper_data)
-            except Exception:
-                enq_ok = False
-            if not enq_ok:
-                asyncio.create_task(self.neo4j.merge_paper(paper_data))
+            await task_queue.enqueue_neo4j_merge(paper_data)
             
             logger.info(f"缓存预热成功: {paper_id}")
             return True
@@ -595,6 +661,64 @@ class CorePaperService:
             return False
     
     # 私有方法
+    async def _resolve_external_id(self, paper_id: str) -> str:
+        """解析外部ID，如果是带前缀的外部ID，尝试映射到真实的paper_id"""
+        try:
+            # 检查是否是带前缀的外部ID格式
+            if ":" not in paper_id:
+                return paper_id
+            
+            prefix, external_id = paper_id.split(":", 1)
+            prefix = prefix.upper()
+            
+            # 使用统一的映射方法
+            external_type = ExternalIdTypes.from_prefix(prefix)
+            if not external_type:
+                # 不是已知的外部ID类型，直接返回原值
+                return paper_id
+            logger.info(f"解析外部ID: {external_id}, {external_type}")
+            # 尝试从映射表中查找真实的paper_id
+            mapped_paper_id = await self.external_mapping.get_paper_id(external_id, external_type)
+            if mapped_paper_id:
+                logger.info(f"解析成功外部ID: {external_id}, {external_type}, {mapped_paper_id}")
+                return mapped_paper_id
+            
+            # 映射未命中，返回去掉前缀的外部ID（兼容模式）
+            return external_id
+            
+        except Exception as e:
+            logger.warning(f"外部ID解析失败 {paper_id}: {e}")
+            return paper_id
+    
+    async def _store_external_id_mappings(self, paper_data: Dict[str, Any]) -> None:
+        """存储论文的外部ID映射关系"""
+        try:
+            paper_id = paper_data.get('paperId')
+            if not paper_id:
+                return
+            
+            external_ids = paper_data.get('externalIds', {})
+            if not external_ids:
+                return
+            
+            # 存储各种外部ID的映射关系
+            for id_type, id_value in external_ids.items():
+                if not id_value:
+                    continue
+                
+                # 使用统一的映射方法
+                external_type = ExternalIdTypes.from_s2_api_type(id_type)
+                if external_type:
+                    logger.info(f"存储外部id映射关系: {paper_id}, {id_type}, {id_value}")
+                    await self.external_mapping.set_mapping(
+                        external_id=str(id_value),
+                        external_type=external_type,
+                        paper_id=paper_id
+                    )
+                    
+        except Exception as e:
+            logger.warning(f"存储外部ID映射失败 {paper_data.get('paperId', 'unknown')}: {e}")
+    
     def _get_cache_key(self, paper_id: str, fields: Optional[str] = None) -> str:
         """生成缓存键"""
         if fields:
@@ -605,42 +729,11 @@ class CorePaperService:
         """从Neo4j获取数据"""
         try:
             # 统一通过 alias 识别优先
-            got = await self.neo4j.get_paper_by_alias(paper_id)
+            got = self.neo4j.ensure_fresh(await self.neo4j.get_paper_by_alias(paper_id))
             return got
         except Exception as e:
             logger.error(f"Neo4j查询失败 paper_id={paper_id}: {e}")
             return None
-    
-    def _is_data_fresh(self, data: Dict, max_age_hours: int = 24) -> bool:
-        """检查数据是否新鲜"""
-        try:
-            last_updated = data.get('lastUpdated')
-            if not last_updated:
-                return False
-            
-            # 支持字符串与Neo4j DateTime(JSON解包后可能为字典)
-            if isinstance(last_updated, str):
-                last_updated = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
-            elif isinstance(last_updated, dict):
-                # 兼容 Neo4j DateTime.toNativeTypes 的序列化: {year, month, day, hour, minute, second, nanosecond, timezone}
-                try:
-                    year = int(last_updated.get('year', 1970))
-                    month = int(last_updated.get('month', 1))
-                    day = int(last_updated.get('day', 1))
-                    hour = int(last_updated.get('hour', 0))
-                    minute = int(last_updated.get('minute', 0))
-                    second = int(last_updated.get('second', 0))
-                    # 忽略纳秒/时区，按本地时间处理
-                    last_updated = datetime(year, month, day, hour, minute, second)
-                except Exception:
-                    return False
-            
-            age = datetime.now() - last_updated.replace(tzinfo=None)
-            return age.total_seconds() < max_age_hours * 3600
-            
-        except Exception as e:
-            logger.error(f"检查数据新鲜度失败: {e}")
-            return False
 
     def _build_field_tree(self, fields: str) -> Dict[str, Dict]:
         """将逗号分隔的字段列表构建为嵌套字段树，支持 authors.name 这类路径"""
@@ -698,8 +791,14 @@ class CorePaperService:
             # 任意裁剪异常时回退到原始数据，避免影响主流程
             return data
     
-    async def _fetch_from_s2(self, paper_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
-        """从S2 API获取数据（主体全量 + 可选关系分页）"""
+    async def _fetch_from_s2(self, paper_id: str, fields: Optional[str] = None, skip_neo4j_enqueue: bool = False) -> Dict[str, Any]:
+        """从S2 API获取数据（主体全量 + 可选关系分页）
+        
+        Args:
+            paper_id: 论文ID
+            fields: 指定返回字段
+            skip_neo4j_enqueue: 是否跳过Neo4j入队（用于ARQ worker环境）
+        """
         # 设置处理状态
         await self.redis.set_task_status(paper_id, "processing")
 
@@ -708,10 +807,10 @@ class CorePaperService:
             body = await self._fetch_paper_body_full(paper_id)
             if not body:
                 raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
-
+            """
             # 2) 判断是否需要抓取关系
             should_fetch_citations = False
-            should_fetch_references = False
+            should_fetch_references = True
             if fields:
                 requested = {f.strip() for f in fields.split(',') if f.strip()}
                 if 'citations' in requested:
@@ -726,7 +825,6 @@ class CorePaperService:
                     should_fetch_references = True
             except Exception:
                 pass
-
             # 全局开关强制抓取（即使超过阈值）
             try:
                 if getattr(settings, 'force_fetch_citations', False):
@@ -735,7 +833,6 @@ class CorePaperService:
                     should_fetch_references = True
             except Exception:
                 pass
-
             relations: Dict[str, Any] = {}
             if should_fetch_citations or should_fetch_references:
                 relations = await self._fetch_relations_segmented(
@@ -743,10 +840,20 @@ class CorePaperService:
                     fetch_citations=should_fetch_citations,
                     fetch_references=should_fetch_references
                 )
-
+            """
+            #2) 抓取引用,不抓取被引
+            relations = await self._fetch_relations_segmented(
+                    paper_id,
+                    fetch_citations=False,
+                    fetch_references=True
+                )
             # 3) 合并并写缓存
             full_data = {**body, **relations}
             await self.redis.set_paper(paper_id, full_data, None)
+           
+            logger.info(f"存储外部id映射关系: {paper_id}")
+            # 3.5) 存储外部ID映射关系
+            await self._store_external_id_mappings(full_data)
 
             # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
             async def _async_neo4j_ingest(data):
@@ -758,6 +865,7 @@ class CorePaperService:
                     ok = await self.neo4j.merge_paper(data)
                     if not ok:
                         return
+                    #从顶层 corpusId、url、title 补全并规范化为 externalIds
                     await self.neo4j.merge_aliases_from_paper(data)
                     await self.neo4j.merge_data_chunks_from_full_data(data)
                     # 根据是否已抓取关系决定是否立即合并 CITES，并为大规模被引创建计划
@@ -769,7 +877,8 @@ class CorePaperService:
                         r_count = int(data.get('referenceCount') or 0)
                     except Exception:
                         r_count = 0
-
+                    await self.neo4j.merge_cites_from_full_data(data)
+                    """
                     # 若任一关系已抓取，则直接落库对应的 CITES 边
                     if should_fetch_citations or should_fetch_references:
                         await self.neo4j.merge_cites_from_full_data(data)
@@ -779,16 +888,13 @@ class CorePaperService:
                         await self.neo4j.create_citations_ingest_plan(
                             data.get('paperId'), c_count, self.relations_page_size
                         )
+                    """
                 except Exception as e:
                     logger.error(f"异步Neo4j入库失败 paper_id={data.get('paperId')}: {e}")
-
-            # 入队后台 Neo4j 入库，失败则回退本地任务
-            try:
-                enq_ok = await task_queue.enqueue_neo4j_merge(full_data)
-            except Exception:
-                enq_ok = False
-            if not enq_ok:
-                asyncio.create_task(_async_neo4j_ingest(full_data))
+            
+            # 入队后台 Neo4j 入库任务（除非在ARQ worker环境中）
+            if not skip_neo4j_enqueue:
+                await task_queue.enqueue_neo4j_merge(full_data)
 
             logger.info(f"从S2获取数据成功: {paper_id}")
             return full_data if not fields else self._format_response(full_data, fields)

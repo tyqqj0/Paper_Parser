@@ -58,24 +58,21 @@ vim .env
 使用 Make（推荐）：
 
 ```bash
-# 启动基础开发环境
-make dev-up
+# 启动完整服务（包含ARQ Worker）
+make up
 
-# 或启动完整环境（包含 Celery）
-make dev-full
+# 或仅启动基础服务（Redis + Neo4j）
+make infra
 ```
 
 或使用 Docker Compose：
 
 ```bash
-# 启动基础环境
-docker-compose --profile dev up -d
+# 启动完整服务（包含ARQ Worker）
+docker-compose up -d
 
-# 启动完整环境（包含 Celery）
-docker-compose --profile dev --profile celery up -d
-
-# 启动 ARQ 轻量队列（可选，与 Celery 并行或替代）
-docker-compose --profile arq up -d arq-worker
+# 仅启动基础服务
+docker-compose up -d redis neo4j api
 ```
 
 ### 4. 验证服务
@@ -85,7 +82,6 @@ docker-compose --profile arq up -d arq-worker
 - **API 文档**: http://localhost:8000/docs
 - **健康检查**: http://localhost:8000/api/v1/health
 - **Neo4j 控制台**: http://localhost:7474 (neo4j/password)
-- **Celery 监控**: http://localhost:5555 (如果启用)
 - **ARQ Worker**: 使用 `docker-compose --profile arq up -d arq-worker` 启动
 
 ## 📚 API 使用示例
@@ -124,26 +120,26 @@ curl "http://localhost:8000/api/v1/proxy/paper/autocomplete?query=neural network
 # 查看所有可用命令
 make help
 
-# 启动开发环境
-make dev-up
+# 启动完整服务
+make up
 
-# 查看日志
-make dev-logs
+# 查看所有服务日志
+make logs
+
+# 查看ARQ Worker日志
+make arq-logs
 
 # 停止服务
-make dev-down
+make down
 
-# 运行测试
-make test
+# 查看服务状态
+make status
 
-# 代码格式化
-make format
+# 进入API容器
+make shell
 
-# 代码检查
-make lint
-
-# 重置数据库
-make reset-db
+# 清理系统
+make clean
 ```
 
 ## 📊 性能指标

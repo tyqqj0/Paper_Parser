@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from loguru import logger
+from arq.connections import RedisSettings
 
 from app.clients.redis_client import redis_client
 from app.clients.neo4j_client import neo4j_client
@@ -15,11 +16,15 @@ from app.services.core_paper_service import core_paper_service
 
 
 class WorkerSettings:
-    functions = [
-        "fetch_from_s2",
-        "neo4j_merge",
-        "set_paper_cache",
-    ]
+    # 函数列表将在文件末尾赋值
+    functions = []
+    
+    # Redis连接配置 - 使用Docker网络中的服务名
+    redis_settings = RedisSettings(
+        host='redis',
+        port=6379,
+        database=0,
+    )
 
 
 async def startup(ctx: Dict[str, Any]):
@@ -47,7 +52,8 @@ async def shutdown(ctx: Dict[str, Any]):
 async def fetch_from_s2(ctx: Dict[str, Any], paper_id: str, fields: Optional[str] = None) -> Dict[str, Any]:
     """后台抓取全量数据并写缓存/入库。"""
     try:
-        return await core_paper_service._fetch_from_s2(paper_id, fields)
+        # 在ARQ worker环境中，跳过Neo4j入队，因为会直接调用neo4j_merge任务
+        return await core_paper_service._fetch_from_s2(paper_id, fields, skip_neo4j_enqueue=True)
     except Exception as e:
         logger.error(f"ARQ fetch_from_s2 执行失败 paper_id={paper_id}: {e}")
         raise
@@ -88,5 +94,13 @@ async def set_paper_cache(ctx: Dict[str, Any], paper_id: str, data: Dict[str, An
     except Exception as e:
         logger.error(f"ARQ set_paper_cache 执行失败 paper_id={paper_id}: {e}")
         return False
+
+
+# 使用可调用对象注册任务函数，确保与 enqueue_job('function_name') 匹配
+WorkerSettings.functions = [
+    fetch_from_s2,
+    neo4j_merge,
+    set_paper_cache,
+]
 
 

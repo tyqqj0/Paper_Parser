@@ -219,16 +219,6 @@ class RedisClient:
             ttl or settings.cache_paper_ttl
         )
     
-    async def get_paper_by_doi(self, doi: str) -> Optional[str]:
-        """通过DOI获取论文ID"""
-        cache_key = CacheKeys.PAPER_DOI.format(doi=doi)
-        return await self.get(cache_key)
-    
-    async def set_paper_doi_mapping(self, doi: str, paper_id: str) -> bool:
-        """设置DOI到论文ID的映射"""
-        cache_key = CacheKeys.PAPER_DOI.format(doi=doi)
-        return await self.set(cache_key, paper_id, settings.cache_paper_ttl)
-    
     async def get_search_result(self, query_hash: str) -> Optional[Dict]:
         """获取搜索结果缓存"""
         cache_key = CacheKeys.SEARCH_QUERY.format(query_hash=query_hash)
@@ -284,6 +274,19 @@ class RedisClient:
         except Exception as e:
             logger.error(f"Redis健康检查失败: {e}")
             return False
+    
+    # 通用缓存方法（向后兼容）
+    async def set_cache(self, key: str, value: Any, expire_seconds: int = None) -> bool:
+        """设置缓存（通用方法）"""
+        return await self.set(key, value, expire_seconds or 3600)
+    
+    async def get_cache(self, key: str) -> Any:
+        """获取缓存（通用方法）"""
+        return await self.get(key)
+    
+    async def delete_cache(self, key: str) -> bool:
+        """删除缓存（通用方法）"""
+        return await self.delete(key)
 
 
 # 全局Redis客户端实例

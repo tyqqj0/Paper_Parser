@@ -8,6 +8,7 @@ from loguru import logger
 
 from app.models.paper import EnhancedPaper, SearchResult, BatchRequest
 from app.services.core_paper_service import core_paper_service
+from app.services.external_id_mapping import ExternalIdTypes
 
 router = APIRouter()
 
@@ -36,9 +37,8 @@ def _is_valid_paper_id(paper_id: str) -> bool:
     return False
 
 # 严格前缀策略：除 40 位 S2 paperId 外，其余均需显式前缀
-_ALLOWED_ID_PREFIXES = {
-    "DOI", "ARXIV", "MAG", "ACL", "PMID", "PMCID", "CORPUSID", "CORPUS", "URL"
-}
+# 注意：为了向后兼容，这里排除了DBLP前缀
+_ALLOWED_ID_PREFIXES = ExternalIdTypes.get_allowed_prefixes()
 
 def _validate_paper_identifier_strict(paper_id: str):
     s = str(paper_id or "").strip()
@@ -52,18 +52,20 @@ def _validate_paper_identifier_strict(paper_id: str):
         head = s.split(":", 1)[0].strip().upper()
         if head in _ALLOWED_ID_PREFIXES:
             return
+        allowed_prefixes = ", ".join(sorted(_ALLOWED_ID_PREFIXES))
         raise HTTPException(
             status_code=400,
             detail=(
                 f"未知ID前缀: {head}. 请使用以下之一: "
-                "DOI, ARXIV, MAG, ACL, PMID, PMCID, CorpusId, URL; 或提供40位S2 paperId"
+                f"{allowed_prefixes}; 或提供40位S2 paperId"
             ),
         )
     # 无前缀且非40位S2 ID：拒绝
+    allowed_prefixes = ", ".join(sorted(_ALLOWED_ID_PREFIXES))
     raise HTTPException(
         status_code=400,
         detail=(
-            "请使用显式前缀（如 DOI:..., ARXIV:..., CorpusId:..., URL:...）或提供40位S2 paperId"
+            f"请使用显式前缀（如 {allowed_prefixes}）或提供40位S2 paperId"
         ),
     )
 
@@ -144,6 +146,7 @@ async def match_paper_title(
     - 语义对齐S2：未命中返回404("Title match not found")；命中仅返回最优1条。
     - 返回形态对齐S2：顶层 {total, offset, data:[paper]}。
     """
+    logger.info(f"a标题精准匹配: {query}, fields={fields}, prefer_local={prefer_local}, fallback_to_s2={fallback_to_s2}")
     try:
         # 仅用于参数校验；limit固定1
         await pre_check(query, 0, 1, fields, None, None, None)
@@ -248,7 +251,8 @@ async def get_paper_references(
 @router.get("/{paper_id:path}")
 async def get_paper(
     paper_id: str,
-    fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔")
+    fields: Optional[str] = Query(None, description="要返回的字段，逗号分隔"),
+    disable_cache: bool = Query(False, description="是否禁用缓存，为true时直接从S2 API获取最新数据")
 ):
     """
     获取论文详情 - 核心API，实现三级缓存
@@ -261,7 +265,7 @@ async def get_paper(
     """
     try:
         _validate_paper_identifier_strict(paper_id)
-        paper_data = await core_paper_service.get_paper(paper_id, fields)
+        paper_data = await core_paper_service.get_paper(paper_id, fields, disable_cache)
         return paper_data
     except HTTPException:
         raise

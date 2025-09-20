@@ -68,14 +68,14 @@ services:
     container_name: paper_parser_api
     ports:
       - "8000:8000"
+    volumes:
+      - .:/app
     environment:
       - DEBUG=false
       - REDIS_URL=redis://redis:6379/0
       - NEO4J_URI=bolt://neo4j:7687
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=password
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
       - ENABLE_SEARCH_BACKGROUND_INGEST=true
       - SEARCH_BACKGROUND_INGEST_TOP_N=3
     depends_on:
@@ -86,30 +86,6 @@ services:
     restart: unless-stopped
     # 移除profiles，默认启动
 
-
-  # Celery Worker (高优先级)
-  celery-worker-high:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: paper_parser_celery_high
-    command: celery -A app.tasks.celery_app worker -Q high_priority -c 4 --loglevel=info
-    volumes:
-      - .:/app
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=password
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
-    depends_on:
-      redis:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles: ["dev", "celery"]
 
   # ARQ Worker（轻量任务队列）
   arq-worker:
@@ -125,54 +101,24 @@ services:
       - NEO4J_URI=bolt://neo4j:7687
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=password
+      - DEBUG=false
     depends_on:
       redis:
         condition: service_healthy
       neo4j:
         condition: service_healthy
     restart: unless-stopped
-    profiles: ["arq"]
+    # 移除profiles，默认启动ARQ worker
 
-  # Celery Worker (中优先级)
-  celery-worker-medium:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: paper_parser_celery_medium
-    command: celery -A app.tasks.celery_app worker -Q medium_priority -c 2 --loglevel=info
-    volumes:
-      - .:/app
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=password
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
-    depends_on:
-      redis:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    restart: unless-stopped
-    profiles: ["celery"]
+    # 为 worker 覆盖健康检查（不再使用镜像中的 HTTP 健康检查）
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport os,socket,sys;host=os.getenv('REDIS_HOST','redis');port=int(os.getenv('REDIS_PORT','6379'));s=socket.create_connection((host,port),2);s.close();print('ok')\nPY"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
-  # Celery Flower (任务监控)
-  celery-flower:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: paper_parser_flower
-    command: celery -A app.tasks.celery_app flower --port=5555
-    ports:
-      - "5555:5555"
-    environment:
-      - CELERY_BROKER_URL=redis://redis:6379/1
-      - CELERY_RESULT_BACKEND=redis://redis:6379/2
-    depends_on:
-      - redis
-    restart: unless-stopped
-    profiles: ["celery", "monitoring"]
+
 
 volumes:
   redis_data:

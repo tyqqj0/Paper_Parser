@@ -17,7 +17,7 @@ Paper Parser 是一个基于 Semantic Scholar API 的学术论文缓存和代理
 - **API 层**：FastAPI + Uvicorn
 - **缓存层**：Redis (热数据缓存 + 任务状态)
 - **存储层**：Neo4j (结构化存储 + 关系查询)
-- **任务队列**：Celery + Redis Broker
+- **任务队列**：ARQ + Redis
 - **外部 API**：Semantic Scholar API
 - **监控**：Prometheus + Grafana
 - **日志**：Loguru + ELK Stack
@@ -59,7 +59,7 @@ Paper Parser 是一个基于 Semantic Scholar API 的学术论文缓存和代理
 │  └─────────────────┴─────────────────┴─────────────────┘│
 ├─────────────────────────────────────────────────────────┤
 │               4. Background Task Layer                 │
-│                  (Celery Workers)                      │
+│                  (ARQ Workers)                         │
 │                                                         │
 │  ┌─────────────────┬─────────────────┬─────────────────┐│
 │  │ DataIngestion   │ CacheManagement │ SystemMaintain  ││
@@ -83,7 +83,7 @@ sequenceDiagram
     participant Redis
     participant Neo4j
     participant S2 API
-    participant Celery
+    participant ARQ
 
     Client->>API Gateway: GET /paper/{id}
     API Gateway->>CoreService: get_paper(id)
@@ -97,14 +97,14 @@ sequenceDiagram
         CoreService->>Neo4j: 查询持久化数据
         alt Neo4j有数据且新鲜
             Neo4j-->>CoreService: 返回数据
-            CoreService->>Celery: 异步更新Redis
+            CoreService->>ARQ: 异步更新Redis
             CoreService-->>API Gateway: 返回结果
             API Gateway-->>Client: 200 OK + 数据
         else 需要从S2获取
             CoreService->>S2 API: 调用原始API
             S2 API-->>CoreService: 返回原始数据
             CoreService->>Redis: 立即缓存
-            CoreService->>Celery: 异步入库Neo4j
+            CoreService->>ARQ: 异步入库Neo4j
             CoreService-->>API Gateway: 返回结果
             API Gateway-->>Client: 200 OK + 数据
         end
@@ -267,15 +267,18 @@ GET  /paper/autocomplete                  # 自动补全
 
 这样可与现有实现兼容（已在用 `HAS_EXTERNAL_ID`），避免边类型膨胀；新增的 alias 类型只需扩展 `type` 值。
 
-#### 2) DataChunk 基类与三分数据
+#### 2) 数据存储策略
 
+**Metadata存储：**
+- 直接存储在 `Paper` 节点属性中：`Paper.metadataJson`, `Paper.metadataUpdated`
+- 避免小数据的额外节点和关系开销，简化查询
+
+**DataChunk 用于大数据：**
 - 节点：`DataChunk { paperId, chunkType, dataJson, lastUpdated }`
 - 标签：
-  - `:DataChunk:PaperMetadata   (chunkType='metadata')`
   - `:DataChunk:PaperCitations  (chunkType='citations')`
   - `:DataChunk:PaperReferences (chunkType='references')`
 - 关系：
-  - `(:Paper)-[:HAS_METADATA]->(:PaperMetadata)`
   - `(:Paper)-[:HAS_CITATIONS]->(:PaperCitations)`
   - `(:Paper)-[:HAS_REFERENCES]->(:PaperReferences)`
 - 索引/约束：`(paperId, chunkType)` 唯一；`paperId` 索引。
@@ -296,7 +299,7 @@ GET  /paper/autocomplete                  # 自动补全
 
 - 在 `Paper` 节点上增加 `ingestStatus`：`"stub" | "full"`。
   - stub：仅通过引用/被引邻居快速创建（只含 paperId/title）
-  - full：已通过 API 拉取过主体，`Paper.dataJson`/`PaperMetadata` 完整
+  - full：已通过 API 拉取过主体，`Paper.dataJson`/`Paper.metadataJson` 完整
 - 合并策略：统一使用 `MERGE (p:Paper {paperId})` 作为唯一主键，不做 title 合并； TITLE_NORM 仅用于 alias 命中，不做自动同名合并，避免歧义。
 
 #### 5) 接入点与职责边界
@@ -407,79 +410,85 @@ class ProxyService:
 ### 任务分类和优先级
 
 ```python
-# 高优先级任务 (立即处理)
-@celery_app.task(priority=9, queue='high_priority')
-def ingest_paper_data(s2_paper_data: dict):
-    """文献数据入库 - 核心数据"""
-    paper_node = parse_s2_paper(s2_paper_data)
-    neo4j_client.merge_paper(paper_node)
+# ARQ 异步任务定义
+async def fetch_and_process_paper(paper_id: str, fields: Optional[str] = None):
+    """完整的论文数据获取和处理流程 - 这是耗时操作"""
+    # 1. 从 S2 API 获取数据（慢操作：网络请求）
+    s2_data = await s2_client.get_paper(paper_id, fields)
     
-@celery_app.task(priority=8, queue='high_priority') 
-def update_cache(cache_key: str, data: dict):
-    """缓存更新 - 用户体验"""
-    redis_client.setex(cache_key, 3600, json.dumps(data))
-
-# 中优先级任务 (批量处理)
-@celery_app.task(priority=5, queue='medium_priority')
-def expand_paper_relations(paper_id: str):
-    """扩展论文关系 - 增强数据"""
-    # 获取并处理引用关系
-    citations = s2_client.get_citations(paper_id)
-    references = s2_client.get_references(paper_id)
+    # 2. 解析并存储到 Neo4j（快操作：本地数据库）
+    paper_node = parse_s2_paper(s2_data)
+    await neo4j_client.merge_paper(paper_node)
     
-    for citation in citations:
-        neo4j_client.create_citation_relation(paper_id, citation['paperId'])
-
-@celery_app.task(priority=4, queue='medium_priority')
-def warm_popular_papers():
-    """预热热门论文缓存"""
-    # 预加载高频访问的论文数据
-    popular_papers = neo4j_client.get_popular_papers(limit=100)
-    for paper in popular_papers:
-        # 预热缓存
-        pass
-
-# 低优先级任务 (后台维护)
-@celery_app.task(priority=1, queue='low_priority')
-def cleanup_expired_data():
-    """清理过期数据 - 系统维护"""
-    # 清理过期缓存和临时数据
-    pass
+    # 3. 更新 Redis 缓存（快操作：本地缓存）
+    cache_key = f"paper:{paper_id}:full"
+    await redis_client.setex(cache_key, 3600, json.dumps(s2_data))
     
-@celery_app.task(priority=1, queue='low_priority')  
+    return s2_data  
 def sync_citation_counts():
     """同步引用数更新 - 数据一致性"""
     # 定期更新动态统计数据
     pass
 ```
 
-### 队列配置
+### 使用示例
 
 ```python
-# celery_config.py
-from kombu import Queue
+# API 端点中的异步调用
+from arq import create_pool
 
-CELERY_ROUTES = {
-    'tasks.ingest_paper_data': {'queue': 'high_priority'},
-    'tasks.update_cache': {'queue': 'high_priority'},
-    'tasks.expand_paper_relations': {'queue': 'medium_priority'},  
-    'tasks.warm_popular_papers': {'queue': 'medium_priority'},
-    'tasks.cleanup_expired_data': {'queue': 'low_priority'},
-    'tasks.sync_citation_counts': {'queue': 'low_priority'},
-}
+@app.get("/paper/{paper_id}")
+async def get_paper(paper_id: str):
+    # 1. 先检查缓存
+    cached = await redis_client.get(f"paper:{paper_id}:full")
+    if cached:
+        return json.loads(cached)
+    
+    # 2. 缓存未命中，启动异步任务
+    redis_pool = await create_pool()
+    job = await redis_pool.enqueue_job(
+        'fetch_and_process_paper', 
+        paper_id
+    )
+    
+    # 3. 返回任务ID，让客户端轮询结果
+    return {"task_id": job.job_id, "status": "processing"}
 
-CELERY_QUEUES = (
-    Queue('high_priority', routing_key='high_priority', priority=9),
-    Queue('medium_priority', routing_key='medium_priority', priority=5),
-    Queue('low_priority', routing_key='low_priority', priority=1),
-)
+@app.get("/task/{task_id}")
+async def get_task_result(task_id: str):
+    # 客户端轮询任务结果
+    redis_pool = await create_pool()
+    job = await redis_pool.get_job(task_id)
+    
+    if job.status == 'complete':
+        return {"status": "complete", "data": job.result}
+    else:
+        return {"status": "processing"}
+```
 
-# 工作进程配置
-CELERY_WORKER_CONCURRENCY = {
-    'high_priority': 4,    # 高优先级队列4个工作进程
-    'medium_priority': 2,  # 中优先级队列2个工作进程  
-    'low_priority': 1,     # 低优先级队列1个工作进程
-}
+### Worker 配置
+
+```python
+# worker.py - ARQ Worker 配置
+
+class WorkerSettings:
+    """ARQ Worker 配置"""
+    
+    functions = [
+        # 核心任务函数 - 处理耗时的S2 API调用
+        fetch_and_process_paper,
+    ]
+    
+    redis_settings = RedisSettings(
+        host='localhost',
+        port=6379,
+        database=0
+    )
+    
+    # Worker 配置
+    max_jobs = 10        # 最多10个并发任务
+    job_timeout = 300    # 任务超时5分钟
+    keep_result = 3600   # 结果保留1小时
 ```
 
 ## 📈 性能指标
@@ -508,7 +517,7 @@ S2 API调用:           < 3000ms
 ```
 Redis 内存:           8GB (约100万篇论文缓存)
 Neo4j 存储:          100GB (约1000万篇论文)
-Celery 工作进程:      7个 (高4+中2+低1)
+ARQ 工作进程:         1个 (最多10个并发任务)
 并发连接数:          1000个
 QPS 目标:            500 req/s
 ```
@@ -574,7 +583,7 @@ RETRY_CONFIG = {
 - CPU、内存、磁盘使用率
 - Redis连接数和内存使用
 - Neo4j查询性能
-- Celery工作进程状态
+- ARQ工作进程状态
 - 网络延迟和带宽使用
 
 # 告警规则
@@ -630,17 +639,9 @@ services:
     ports: ["7687:7687", "7474:7474"] 
     volumes: ["neo4j_data:/data"]
     
-  celery-worker-high:
+  arq-worker:
     image: paper-parser:latest
-    command: celery worker -Q high_priority -c 4
-    
-  celery-worker-medium:
-    image: paper-parser:latest  
-    command: celery worker -Q medium_priority -c 2
-    
-  celery-worker-low:
-    image: paper-parser:latest
-    command: celery worker -Q low_priority -c 1
+    command: arq app.tasks.worker.WorkerSettings
 ```
 
 ## 📅 开发计划
@@ -656,7 +657,7 @@ services:
 - [ ] Citations/References 缓存实现
 - [ ] 搜索功能缓存
 - [ ] 批量查询接口
-- [ ] Celery 异步任务系统
+- [ ] ARQ 异步任务系统
 - [ ] 错误处理和降级机制
 
 ### Phase 3: 优化完善 (Week 3)
@@ -701,9 +702,6 @@ class Settings(BaseSettings):
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str = "password"
     
-    # Celery配置
-    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
-    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
     
     # 监控配置
     ENABLE_METRICS: bool = True

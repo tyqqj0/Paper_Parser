@@ -8,6 +8,7 @@ from loguru import logger
 
 from app.services.core_paper_service import core_paper_service
 from app.api.v1.paper import _validate_paper_identifier_strict
+from app.clients.redis_client import redis_client
 
 
 router = APIRouter()
@@ -50,4 +51,16 @@ async def warm_paper_cache(
         logger.error(f"缓存预热失败 paper_id={paper_id}: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
+
+
+@router.delete("/cache")
+async def clear_all_cache():
+    """清空所有Redis缓存（谨慎操作）"""
+    try:
+        # 使用按模式删除来避免需要FLUSHDB权限
+        deleted = await redis_client.delete_by_pattern("*")
+        return {"success": True, "deleted": int(deleted)}
+    except Exception as e:
+        logger.error(f"清空所有缓存失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
 

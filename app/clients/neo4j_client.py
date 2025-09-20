@@ -10,6 +10,7 @@ from loguru import logger
 
 from app.core.config import settings
 from app.models.paper import EnhancedPaper
+from app.utils.title_norm import normalize_title_norm
 
 
 class Neo4jClient:
@@ -33,9 +34,6 @@ class Neo4jClient:
             
             logger.info("Neo4j连接成功")
             
-            # 创建索引
-            await self._create_indexes()
-            
         except Exception as e:
             logger.error(f"Neo4j连接失败: {e}")
             raise
@@ -46,33 +44,6 @@ class Neo4jClient:
             await self.driver.close()
             logger.info("Neo4j连接已关闭")
     
-    async def _create_indexes(self):
-        """创建必要的索引"""
-        indexes = [
-            # 论文索引
-            "CREATE INDEX paper_id IF NOT EXISTS FOR (p:Paper) ON (p.paperId)",
-            "CREATE INDEX corpus_id IF NOT EXISTS FOR (p:Paper) ON (p.corpusId)",
-            "CREATE INDEX paper_title IF NOT EXISTS FOR (p:Paper) ON (p.title)",
-            "CREATE INDEX paper_year IF NOT EXISTS FOR (p:Paper) ON (p.year)",
-            "CREATE INDEX paper_ingest_status IF NOT EXISTS FOR (p:Paper) ON (p.ingestStatus)",
-            # 外部ID唯一约束（type,value）
-            "CREATE CONSTRAINT external_id_unique IF NOT EXISTS FOR (e:ExternalId) REQUIRE (e.type, e.value) IS UNIQUE",
-            # DataChunk 索引与唯一约束
-            "CREATE INDEX datachunk_paper_id IF NOT EXISTS FOR (d:DataChunk) ON (d.paperId)",
-            "CREATE CONSTRAINT datachunk_unique IF NOT EXISTS FOR (d:DataChunk) REQUIRE (d.paperId, d.chunkType) IS UNIQUE",
-            # Paper 标题全文索引（供搜索使用）
-            "CREATE FULLTEXT INDEX paperFulltext IF NOT EXISTS FOR (p:Paper) ON EACH [p.title]",
-            # 作者索引
-            "CREATE INDEX author_id IF NOT EXISTS FOR (a:Author) ON (a.authorId)",
-            "CREATE INDEX author_name IF NOT EXISTS FOR (a:Author) ON (a.name)",
-        ]
-        
-        async with self.driver.session(database=settings.neo4j_database) as session:
-            for index_query in indexes:
-                try:
-                    await session.run(index_query)
-                except Exception as e:
-                    logger.warning(f"创建索引失败: {index_query}, 错误: {e}")
     
     async def get_paper(self, paper_id: str) -> Optional[Dict]:
         """根据paperId获取论文"""
@@ -107,17 +78,27 @@ class Neo4jClient:
                 return None
     
     async def get_paper_by_external_id(self, id_type: str, id_value: str) -> Optional[Dict]:
-        """根据外部ID获取论文"""
+        """根据外部ID获取论文，使用新的单独属性方案"""
         if self.driver is None:
             return None
-        query = """
-        MATCH (p:Paper)-[:HAS_EXTERNAL_ID]->(e:ExternalId {type: $id_type, value: $id_value})
-        RETURN p
-        """
+        # 统一使用 externalIds JSON 字段查询（除了特殊处理的字段）
+        if id_type == "TITLE_NORM":
+            # 标题归一化仍使用单独属性
+            query = "MATCH (p:Paper) WHERE p.title_norm = $id_value RETURN p"
+            query_params = {"id_value": id_value}
+        else:
+            # 其他所有外部ID都从 externalIds JSON 字段中查询
+            query = """
+            MATCH (p:Paper) 
+            WHERE p.externalIds IS NOT NULL 
+            AND apoc.convert.fromJsonMap(p.externalIds)[$id_type] = $id_value 
+            RETURN p
+            """
+            query_params = {"id_type": id_type, "id_value": id_value}
         
         async with self.driver.session(database=settings.neo4j_database) as session:
             try:
-                result = await session.run(query, id_type=id_type, id_value=id_value)
+                result = await session.run(query, **query_params)
                 record = await result.single()
                 if record:
                     paper_node = record["p"]
@@ -271,7 +252,7 @@ class Neo4jClient:
             if direct:
                 return direct
 
-            # 最后尝试 TITLE_NORM
+            # 最后尝试 TITLE_NORM（存储在externalIds map中）
             tnorm = self._normalize_title_norm(s)
             if tnorm:
                 title_hit = await self.get_paper_by_external_id("TITLE_NORM", tnorm)
@@ -295,8 +276,8 @@ class Neo4jClient:
             if not norm:
                 return []
             cypher = """
-            MATCH (p:Paper)-[:HAS_EXTERNAL_ID]->(e:ExternalId {type: 'TITLE_NORM'})
-            WHERE e.value CONTAINS $needle OR e.value STARTS WITH $needle
+            MATCH (p:Paper)
+            WHERE p.title_norm CONTAINS $needle OR p.title_norm STARTS WITH $needle
             RETURN p
             LIMIT $limit
             """
@@ -332,6 +313,8 @@ class Neo4jClient:
         SET p += $properties,
             p.lastUpdated = datetime(),
             p.dataJson = $data_json,
+            p.authors = $authors_json,
+            p.title_norm = $title_norm,
             p.ingestStatus = 'full'
         RETURN p.paperId as paperId
         """
@@ -351,6 +334,13 @@ class Neo4jClient:
                 
                 # 分离JSON数据和属性
                 data_json = json.dumps(paper_data, ensure_ascii=False, default=str)
+                authors_value = paper_data.get("authors")
+                authors_json = None
+                try:
+                    if authors_value is not None:
+                        authors_json = json.dumps(authors_value, ensure_ascii=False, default=str)
+                except Exception:
+                    authors_json = None
                 properties_raw = {
                     key: value for key, value in paper_data.items()
                     if key not in ["externalIds", "authors", "citations", "references"]
@@ -377,12 +367,23 @@ class Neo4jClient:
                         # 其他非原始类型一律忽略，完整对象已写入 dataJson
                         continue
                 
+                # 计算并传递 title_norm（如果有标题）
+                title_norm = None
+                try:
+                    title_value = paper_data.get("title")
+                    if isinstance(title_value, str) and title_value.strip():
+                        title_norm = normalize_title_norm(title_value)
+                except Exception:
+                    title_norm = None
+
                 # 执行合并
                 result = await session.run(
                     query,
                     paper_id=paper_id,
                     properties=properties,
-                    data_json=data_json
+                    data_json=data_json,
+                    authors_json=authors_json,
+                    title_norm=title_norm
                 )
                 
                 record = await result.single()
@@ -408,51 +409,46 @@ class Neo4jClient:
                 return False
     
     async def _merge_external_ids(self, session: AsyncSession, paper_id: str, external_ids: Dict):
-        """处理外部ID关系"""
+        """处理外部ID，将其存储为Paper节点的externalIds JSON字段"""
+        if not external_ids:
+            return
+            
+        # 归一化所有外部ID
+        normalized_external_ids = {}
+        
         for id_type, id_value in external_ids.items():
             if not id_value:
                 continue
-
-            # 统一归一化，同步与别名合并逻辑，避免重复节点
-            normalized_value: Optional[str] = None
+                
+            # 归一化值
+            normalized_value = self._normalize_external_id(id_type, id_value)
+            if normalized_value:
+                normalized_external_ids[id_type] = normalized_value
+        
+        # 将归一化后的外部ID存储为JSON字符串，并同步 title_norm（若提供）
+        if normalized_external_ids:
+            external_ids_json = json.dumps(normalized_external_ids, ensure_ascii=False)
+            title_norm_value = None
             try:
-                t = str(id_type).strip()
-                if t == "DOI":
-                    normalized_value = self._normalize_doi(str(id_value))
-                elif t == "ArXiv":
-                    normalized_value = self._normalize_arxiv(str(id_value))
-                elif t == "CorpusId":
-                    normalized_value = self._normalize_corpus_id(id_value)
-                elif t == "MAG":
-                    normalized_value = self._normalize_mag(id_value)
-                elif t == "ACL":
-                    normalized_value = self._normalize_acl(str(id_value))
-                elif t == "PMID":
-                    normalized_value = self._normalize_pmid(id_value)
-                elif t == "PMCID":
-                    normalized_value = self._normalize_pmcid(id_value)
-                elif t == "URL":
-                    normalized_value = self._normalize_url(str(id_value))
+                raw_title = external_ids.get("TITLE_NORM") or external_ids.get("title")
+                if raw_title:
+                    title_norm_value = normalize_title_norm(str(raw_title))
             except Exception:
-                normalized_value = None
-
-            final_value = normalized_value if normalized_value else str(id_value)
+                title_norm_value = None
 
             query = """
             MATCH (p:Paper {paperId: $paper_id})
-            MERGE (e:ExternalId {type: $id_type, value: $id_value})
-            SET e:Alias
-            MERGE (p)-[:HAS_EXTERNAL_ID]->(e)
+            SET p.externalIds = $external_ids_json
             """
+            params = {"paper_id": paper_id, "external_ids_json": external_ids_json}
+            if title_norm_value:
+                query += ", p.title_norm = $title_norm"
+                params["title_norm"] = title_norm_value
             try:
-                await session.run(
-                    query,
-                    paper_id=paper_id,
-                    id_type=id_type,
-                    id_value=final_value,
-                )
+                await session.run(query, **params)
+                logger.debug(f"更新外部ID成功 paper_id={paper_id}, 外部ID数量={len(normalized_external_ids)}")
             except Exception as e:
-                logger.error(f"创建外部ID关系失败 {id_type}={id_value}: {e}")
+                logger.error(f"更新外部ID属性失败 paper_id={paper_id}: {e}")
     
     async def _merge_authors(self, session: AsyncSession, paper_id: str, authors: List[Dict]):
         """处理作者关系"""
@@ -475,7 +471,7 @@ class Neo4jClient:
                     logger.error(f"创建作者关系失败 author_id={author.get('authorId')}: {e}")
 
     async def merge_aliases_from_paper(self, paper_data: Dict) -> bool:
-        """基于论文数据合并规范化的别名。
+        """基于论文数据合并规范化的外部ID到Paper节点属性。
 
         支持类型：DOI/ArXiv/CorpusId/URL/TITLE_NORM/MAG/ACL/PMID/PMCID
         """
@@ -486,83 +482,37 @@ class Neo4jClient:
             if not paper_id:
                 return False
 
-            aliases: List[Dict[str, str]] = []
-
-            # externalIds: DOI / ArXiv / CorpusId
+            # 准备外部ID数据
+            external_ids = {}
             ext = paper_data.get("externalIds") or {}
-            doi = ext.get("DOI")
-            if isinstance(doi, str):
-                norm = self._normalize_doi(doi)
-                if norm:
-                    aliases.append({"type": "DOI", "value": norm})
-            arxiv = ext.get("ArXiv")
-            if isinstance(arxiv, str):
-                norm = self._normalize_arxiv(arxiv)
-                if norm:
-                    aliases.append({"type": "ArXiv", "value": norm})
-            corpus = ext.get("CorpusId") or paper_data.get("corpusId")
+            
+            # 添加externalIds中的数据
+            for id_type, id_value in ext.items():
+                if id_value:
+                    external_ids[id_type] = id_value
+            
+            # 添加corpusId（如果在顶层）
+            corpus = paper_data.get("corpusId")
             if corpus is not None:
-                try:
-                    aliases.append({"type": "CorpusId", "value": self._normalize_corpus_id(corpus)})
-                except Exception:
-                    pass
-            mag = ext.get("MAG")
-            if mag is not None:
-                try:
-                    aliases.append({"type": "MAG", "value": self._normalize_mag(mag)})
-                except Exception:
-                    pass
-            acl = ext.get("ACL")
-            if isinstance(acl, str):
-                norm = self._normalize_acl(acl)
-                if norm:
-                    aliases.append({"type": "ACL", "value": norm})
-            pmid = ext.get("PMID")
-            if pmid is not None:
-                try:
-                    aliases.append({"type": "PMID", "value": self._normalize_pmid(pmid)})
-                except Exception:
-                    pass
-            pmcid = ext.get("PMCID")
-            if pmcid is not None:
-                try:
-                    aliases.append({"type": "PMCID", "value": self._normalize_pmcid(pmcid)})
-                except Exception:
-                    pass
-
-            # URL（优先使用顶层url，其次externalIds.URL）
+                external_ids["CorpusId"] = corpus
+            
+            # 添加URL（优先使用顶层url）
             url = paper_data.get("url")
-            if isinstance(url, str):
-                norm = self._normalize_url(url)
-                if norm:
-                    aliases.append({"type": "URL", "value": norm})
-            else:
-                url2 = ext.get("URL")
-                if isinstance(url2, str):
-                    norm2 = self._normalize_url(url2)
-                    if norm2:
-                        aliases.append({"type": "URL", "value": norm2})
-
-            # TITLE_NORM（强匹配用，避免模糊）
+            if isinstance(url, str) and url.strip():
+                external_ids["URL"] = url
+            
+            # 添加TITLE_NORM
             title = paper_data.get("title")
-            if isinstance(title, str):
-                norm = self._normalize_title_norm(title)
-                if norm:
-                    aliases.append({"type": "TITLE_NORM", "value": norm})
+            if isinstance(title, str) and title.strip():
+                external_ids["TITLE_NORM"] = title
 
-            if not aliases:
+            if not external_ids:
                 return True
 
-            cypher = """
-            MATCH (p:Paper {paperId: $paper_id})
-            UNWIND $aliases AS a
-            MERGE (e:ExternalId {type: a.type, value: a.value})
-            SET e:Alias
-            MERGE (p)-[:HAS_EXTERNAL_ID]->(e)
-            """
-
+            # 使用已有的_merge_external_ids方法
             async with self.driver.session(database=settings.neo4j_database) as session:
-                await session.run(cypher, paper_id=paper_id, aliases=aliases)
+                await self._merge_external_ids(session, paper_id, external_ids)
+            
             return True
         except Exception as e:
             safe_id = None
@@ -570,11 +520,11 @@ class Neo4jClient:
                 safe_id = paper_data.get("paperId")
             except Exception:
                 pass
-            logger.error(f"合并别名失败 paper_id={safe_id}: {e}")
+            logger.error(f"合并外部ID失败 paper_id={safe_id}: {e}")
             return False
 
     async def merge_data_chunks_from_full_data(self, paper_data: Dict) -> bool:
-        """为给定论文写入三类 DataChunk（metadata/citations/references）。"""
+        """为给定论文写入metadata到Paper节点属性，以及citations/references DataChunk。"""
         try:
             if self.driver is None:
                 return False
@@ -594,17 +544,15 @@ class Neo4jClient:
             references_json = json.dumps(references, ensure_ascii=False, default=str) if references is not None else None
 
             async with self.driver.session(database=settings.neo4j_database) as session:
-                # metadata
+                # metadata - 直接存储到Paper节点属性中
                 try:
                     q = """
                     MATCH (p:Paper {paperId: $paper_id})
-                    MERGE (m:DataChunk:PaperMetadata {paperId: $paper_id, chunkType: 'metadata'})
-                    SET m.dataJson = $metadata_json, m.lastUpdated = datetime()
-                    MERGE (p)-[:HAS_METADATA]->(m)
+                    SET p.metadataJson = $metadata_json, p.metadataUpdated = datetime()
                     """
                     await session.run(q, paper_id=paper_id, metadata_json=metadata_json)
                 except Exception as e:
-                    logger.error(f"写入metadata数据块失败 paper_id={paper_id}: {e}")
+                    logger.error(f"写入metadata到Paper节点失败 paper_id={paper_id}: {e}")
 
                 # citations
                 if citations_json is not None:
@@ -648,14 +596,46 @@ class Neo4jClient:
             refs_raw = paper_data.get("references") if isinstance(paper_data.get("references"), list) else []
             cites_raw = paper_data.get("citations") if isinstance(paper_data.get("citations"), list) else []
 
-            references = [
-                {"paperId": r.get("paperId"), "title": r.get("title")}
-                for r in refs_raw if isinstance(r, dict) and r.get("paperId")
-            ]
-            citations = [
-                {"paperId": c.get("paperId"), "title": c.get("title")}
-                for c in cites_raw if isinstance(c, dict) and c.get("paperId")
-            ]
+            references = []
+            for idx, r in enumerate(refs_raw):
+                if isinstance(r, dict) and r.get("paperId"):
+                    title_value = r.get("title")
+                    # 将 authors 保持为 JSON 字符串以与主节点保持一致
+                    authors_json = None
+                    try:
+                        if isinstance(r.get("authors"), list):
+                            authors_json = json.dumps(r.get("authors"), ensure_ascii=False, default=str)
+                    except Exception:
+                        authors_json = None
+                    references.append({
+                        "paperId": r.get("paperId"),
+                        "title": title_value,
+                        "title_norm": normalize_title_norm(title_value) if title_value else None,
+                        "position": idx,
+                        "venue": r.get("venue"),
+                        "year": r.get("year"),
+                        "citationCount": r.get("citationCount"),
+                        "authors_json": authors_json,
+                    })
+            citations = []
+            for c in cites_raw:
+                if isinstance(c, dict) and c.get("paperId"):
+                    title_value = c.get("title")
+                    authors_json = None
+                    try:
+                        if isinstance(c.get("authors"), list):
+                            authors_json = json.dumps(c.get("authors"), ensure_ascii=False, default=str)
+                    except Exception:
+                        authors_json = None
+                    citations.append({
+                        "paperId": c.get("paperId"),
+                        "title": title_value,
+                        "title_norm": normalize_title_norm(title_value) if title_value else None,
+                        "venue": c.get("venue"),
+                        "year": c.get("year"),
+                        "citationCount": c.get("citationCount"),
+                        "authors_json": authors_json,
+                    })
 
             async with self.driver.session(database=settings.neo4j_database) as session:
                 # references: (p)-[:CITES]->(ref)
@@ -664,8 +644,15 @@ class Neo4jClient:
                     MATCH (p:Paper {paperId: $paper_id})
                     UNWIND $references AS ref
                     MERGE (r:Paper {paperId: ref.paperId})
-                    ON CREATE SET r.title = ref.title, r.ingestStatus = 'stub'
-                    MERGE (p)-[:CITES]->(r)
+                    ON CREATE SET r.title = ref.title,
+                                  r.ingestStatus = 'stub',
+                                  r.title_norm = ref.title_norm,
+                                  r.venue = ref.venue,
+                                  r.year = ref.year,
+                                  r.citationCount = ref.citationCount,
+                                  r.authors = ref.authors_json
+                    MERGE (p)-[rel:CITES]->(r)
+                    SET rel.position = ref.position
                     """
                     try:
                         await session.run(q_ref, paper_id=paper_id, references=references)
@@ -678,7 +665,13 @@ class Neo4jClient:
                     MATCH (p:Paper {paperId: $paper_id})
                     UNWIND $citations AS cite
                     MERGE (c:Paper {paperId: cite.paperId})
-                    ON CREATE SET c.title = cite.title, c.ingestStatus = 'stub'
+                    ON CREATE SET c.title = cite.title,
+                                  c.ingestStatus = 'stub',
+                                  c.title_norm = cite.title_norm,
+                                  c.venue = cite.venue,
+                                  c.year = cite.year,
+                                  c.citationCount = cite.citationCount,
+                                  c.authors = cite.authors_json
                     MERGE (c)-[:CITES]->(p)
                     """
                     try:
@@ -752,19 +745,34 @@ class Neo4jClient:
             return None
 
     def _normalize_title_norm(self, title: str) -> Optional[str]:
-        try:
-            import re
-            t = title.lower()
-            t = re.sub(r"\s+", " ", t)
-            t = re.sub(r"[\p{P}\p{S}]", "", t)
-            t = t.strip()
-            return t if t else None
-        except Exception:
-            try:
-                return title.strip().lower() or None
-            except Exception:
-                return None
+        # Deprecated: keep for backward compatibility; delegate to util
+        return normalize_title_norm(title)
 
+    def _normalize_external_id(self, id_type: str, value: Any) -> Optional[str]:
+        """统一的外部ID归一化方法"""
+        try:
+            if id_type == "DOI":
+                return self._normalize_doi(str(value))
+            elif id_type == "ArXiv":
+                return self._normalize_arxiv(str(value))
+            elif id_type == "CorpusId":
+                return self._normalize_corpus_id(value)
+            elif id_type == "MAG":
+                return self._normalize_mag(value)
+            elif id_type == "ACL":
+                return self._normalize_acl(str(value))
+            elif id_type == "PMID":
+                return self._normalize_pmid(value)
+            elif id_type == "PMCID":
+                return self._normalize_pmcid(value)
+            elif id_type == "URL":
+                return self._normalize_url(str(value))
+            else:
+                # 未知类型，直接返回字符串形式
+                return str(value).strip() if value else None
+        except Exception:
+            return None
+    
     def _normalize_corpus_id(self, value: Any) -> str:
         return str(int(value))
 
@@ -815,7 +823,7 @@ class Neo4jClient:
                 logger.error(f"创建引用关系失败 {citing_paper_id} -> {cited_paper_id}: {e}")
                 return False
     
-    async def get_citations(self, paper_id: str, limit: int = 100) -> List[Dict]:
+    async def get_citations(self, paper_id: str, limit: int = 100, offset: int = 0) -> List[Dict]:
         """获取论文的引用文献"""
         if self.driver is None:
             return []
@@ -823,12 +831,13 @@ class Neo4jClient:
         MATCH (p:Paper {paperId: $paper_id})<-[:CITES]-(citing:Paper)
         RETURN citing
         ORDER BY citing.citationCount DESC
+        SKIP $offset
         LIMIT $limit
         """
         
         async with self.driver.session(database=settings.neo4j_database) as session:
             try:
-                result = await session.run(query, paper_id=paper_id, limit=limit)
+                result = await session.run(query, paper_id=paper_id, limit=limit, offset=offset)
                 citations = []
                 async for record in result:
                     citations.append(dict(record["citing"]))
@@ -837,27 +846,78 @@ class Neo4jClient:
                 logger.error(f"获取引用文献失败 paper_id={paper_id}: {e}")
                 return []
     
-    async def get_references(self, paper_id: str, limit: int = 100) -> List[Dict]:
+    async def get_references(self, paper_id: str, limit: int = 100, offset: int = 0) -> List[Dict]:
         """获取论文的参考文献"""
         if self.driver is None:
             return []
         query = """
-        MATCH (p:Paper {paperId: $paper_id})-[:CITES]->(referenced:Paper)
-        RETURN referenced
-        ORDER BY referenced.citationCount DESC
+        MATCH (p:Paper {paperId: $paper_id})-[rel:CITES]->(referenced:Paper)
+        RETURN referenced, rel, p.lastUpdated as last_updated
+        ORDER BY coalesce(rel.position, -1) ASC, referenced.citationCount DESC
+        SKIP $offset
         LIMIT $limit
         """
         
         async with self.driver.session(database=settings.neo4j_database) as session:
             try:
-                result = await session.run(query, paper_id=paper_id, limit=limit)
+                result = await session.run(query, paper_id=paper_id, limit=limit, offset=offset)
                 references = []
                 async for record in result:
-                    references.append(dict(record["referenced"]))
+                    last_updated = record.get("last_updated")
+                    if not self._is_data_fresh(last_updated):
+                        continue
+                    
+                    props = dict(record["referenced"])
+                    # 将 authors 从 JSON 字符串解码为列表
+                    try:
+                        authors_val = props.get("authors")
+                        if isinstance(authors_val, str) and authors_val:
+                            decoded = json.loads(authors_val)
+                            props["authors"] = decoded
+                    except Exception:
+                        pass
+                    references.append(props)
                 return references
             except Exception as e:
                 logger.error(f"获取参考文献失败 paper_id={paper_id}: {e}")
                 return []
+
+    async def get_references_total(self, paper_id: str) -> int:
+        """获取论文参考文献的总数"""
+        if self.driver is None:
+            return 0
+        
+        # 优先使用节点的 referenceCount 属性，如果不存在则回退到关系计数
+        query = """
+        MATCH (p:Paper {paperId: $paper_id})
+        OPTIONAL MATCH (p)-[rel:CITES]->(referenced:Paper)
+        RETURN p.referenceCount AS node_count, count(referenced) AS relation_count
+        """
+        async with self.driver.session(database=settings.neo4j_database) as session:
+            try:
+                result = await session.run(query, paper_id=paper_id)
+                record = await result.single()
+                if record is None:
+                    return 0
+                
+                # 优先使用节点属性
+                node_count = record["node_count"]
+                if node_count is not None:
+                    try:
+                        return int(node_count)
+                    except (ValueError, TypeError):
+                        pass
+                
+                # 回退到关系计数
+                relation_count = record["relation_count"]
+                try:
+                    return int(relation_count)
+                except (ValueError, TypeError):
+                    return 0
+                    
+            except Exception as e:
+                logger.error(f"获取参考文献总数失败 paper_id={paper_id}: {e}")
+                return 0
     
     async def search_papers(
         self, 
@@ -866,6 +926,7 @@ class Neo4jClient:
         offset: int = 0
     ) -> List[Dict]:
         """搜索论文"""
+        logger.info(f"a搜索论文: {query}, limit={limit}, offset={offset}")
         if self.driver is None:
             return []
         cypher_query = """
@@ -880,10 +941,8 @@ class Neo4jClient:
         async with self.driver.session(database=settings.neo4j_database) as session:
             try:
                 result = await session.run(
-                    cypher_query, 
-                    query=query, 
-                    offset=offset, 
-                    limit=limit
+                    cypher_query,
+                    {"query": query, "offset": offset, "limit": limit}
                 )
                 papers = []
                 async for record in result:
@@ -918,9 +977,12 @@ class Neo4jClient:
         """获取数据库统计信息"""
         queries = {
             "total_papers": "MATCH (p:Paper) RETURN count(p) as count",
-            "total_authors": "MATCH (a:Author) RETURN count(a) as count",
+            "total_authors": "MATCH (a:Author) RETURN count(a) as count", 
             "total_citations": "MATCH ()-[:CITES]->() RETURN count(*) as count",
-            "total_external_ids": "MATCH (e:ExternalId) RETURN count(e) as count"
+            "papers_with_doi": "MATCH (p:Paper) WHERE p.doi IS NOT NULL RETURN count(p) as count",
+            "papers_with_arxiv": "MATCH (p:Paper) WHERE p.arxiv IS NOT NULL RETURN count(p) as count",
+            "papers_with_mag": "MATCH (p:Paper) WHERE p.mag IS NOT NULL RETURN count(p) as count",
+            "papers_with_dblp": "MATCH (p:Paper) WHERE p.dblp IS NOT NULL RETURN count(p) as count"
         }
         
         stats = {}
@@ -947,6 +1009,42 @@ class Neo4jClient:
             logger.error(f"Neo4j健康检查失败: {e}")
             return False
 
+    def _is_data_fresh(self, last_updated, max_age_hours: int = 2400) -> bool:
+        """检查数据是否新鲜"""
+        try:
+            if not last_updated:
+                return False
+            # 转换为 Python datetime 对象
+            if isinstance(last_updated, datetime):
+                # 已经是 Python datetime 对象
+                converted_datetime = last_updated
+            elif hasattr(last_updated, 'to_native'):
+                # Neo4j DateTime 对象，使用 to_native() 方法
+                converted_datetime = last_updated.to_native()
+            elif isinstance(last_updated, str):
+                # 字符串格式的时间
+                converted_datetime = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+            else:
+                # 其他格式，返回 False 表示数据不新鲜
+                logger.warning(f"不支持的时间格式: {type(last_updated)}")
+                return False
+            
+            # 移除时区信息进行比较
+            if converted_datetime.tzinfo is not None:
+                converted_datetime = converted_datetime.replace(tzinfo=None)
+            
+            # 计算时间差
+            age = datetime.now() - converted_datetime
+            return age.total_seconds() < max_age_hours * 3600
+            
+        except Exception as e:
+            logger.error(f"检查数据新鲜度失败: {e}")
+            return False
+    def ensure_fresh(self, data: Dict) -> Dict:
+        """确保数据新鲜"""
+        if not self._is_data_fresh(data.get('lastUpdated')):
+            return None
+        return data
 
 # 全局Neo4j客户端实例
 neo4j_client = Neo4jClient()

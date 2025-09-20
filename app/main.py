@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
         await redis_client.connect()
         await neo4j_client.connect()
         # S2 SDK客户端在初始化时就已经准备就绪，不需要connect
-        # 连接任务队列（若不可用将自动降级）
+        # 连接ARQ任务队列
         await task_queue.connect()
         
         logger.info("所有服务连接成功")

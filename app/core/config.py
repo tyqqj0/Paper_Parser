@@ -35,14 +35,8 @@ class Settings(BaseSettings):
     neo4j_database: str = Field(default="neo4j", alias="NEO4J_DATABASE")
     
     # Celery配置
-    celery_broker_url: str = Field(
-        default="redis://localhost:6379/1", 
-        alias="CELERY_BROKER_URL"
-    )
-    celery_result_backend: str = Field(
-        default="redis://localhost:6379/2", 
-        alias="CELERY_RESULT_BACKEND"
-    )
+    celery_broker_url: str = Field(default="redis://localhost:6379/1", alias="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(default="redis://localhost:6379/2", alias="CELERY_RESULT_BACKEND")
     
     # 监控配置
     enable_metrics: bool = Field(default=True, alias="ENABLE_METRICS")
@@ -79,6 +73,14 @@ class Settings(BaseSettings):
         default=150, alias="SEARCH_BACKGROUND_INGEST_DELAY_STEP_MS"
     )
     
+    # 外部ID映射配置
+    external_id_mapping_db_path: str = Field(
+        default="data/external_id_mapping.db", alias="EXTERNAL_ID_MAPPING_DB_PATH"
+    )
+    external_id_mapping_cleanup_days: int = Field(
+        default=90, alias="EXTERNAL_ID_MAPPING_CLEANUP_DAYS"
+    )
+    
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -92,16 +94,11 @@ settings = Settings()
 class CacheKeys:
     """缓存键模板"""
     
-    # 论文相关
+    # 论文相关 - 统一使用 paper_id 作为缓存键
     PAPER_FULL = "paper:{paper_id}:full"
     PAPER_BASIC = "paper:{paper_id}:basic"
     PAPER_CITATIONS = "paper:{paper_id}:citations"
     PAPER_REFERENCES = "paper:{paper_id}:references"
-    
-    # 外部ID映射
-    PAPER_DOI = "paper:doi:{doi}"
-    PAPER_ARXIV = "paper:arxiv:{arxiv_id}"
-    PAPER_PUBMED = "paper:pubmed:{pubmed_id}"
     
     # 搜索相关
     SEARCH_QUERY = "search:{query_hash}"
