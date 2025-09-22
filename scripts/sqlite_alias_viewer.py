@@ -17,6 +17,9 @@ EXTERNAL_ID_TYPES = {
     "DOI", "ArXiv", "CorpusId", "MAG", "ACL", "PMID", "PMCID", "URL", "TITLE_NORM", "DBLP"
 }
 
+# 默认数据库路径：基于脚本所在项目根目录 Paper_Parser/data/external_id_mapping.db
+DEFAULT_DB_PATH = (Path(__file__).resolve().parents[1] / "data" / "external_id_mapping.db")
+
 class SQLiteAliasViewer:
     """SQLite别名映射查看器"""
     
@@ -429,8 +432,8 @@ def main():
     parser = argparse.ArgumentParser(description="SQLite别名映射查看器")
     parser.add_argument(
         "--db", "-d", 
-        default="data/external_id_mapping.db",
-        help="SQLite数据库文件路径 (默认: data/external_id_mapping.db)"
+        default=str(DEFAULT_DB_PATH),
+        help=f"SQLite数据库文件路径 (默认: {DEFAULT_DB_PATH})"
     )
     
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
@@ -490,7 +493,7 @@ def main():
     try:
         viewer = SQLiteAliasViewer(args.db)
         
-        print(f"🗃️  数据库: {args.db}")
+        print(f"🗃️  数据库: {viewer.db_path}")
         
         if args.command == "info":
             viewer.show_table_info()

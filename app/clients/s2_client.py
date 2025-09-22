@@ -389,7 +389,7 @@ class S2SDKClient:
         offset: int = 0,
         fields: Optional[List[str]] = None
     ) -> Optional[Dict[str, Any]]:
-        """获取论文参考文献"""
+        """获取论文参考文献,经测试limit最大200"""
         try:
             if not fields:
                 fields = [

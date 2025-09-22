@@ -16,7 +16,7 @@ from app.clients.s2_client import s2_client
 from app.models.paper import EnhancedPaper, PaperFieldsConfig, SearchResult, BatchResult
 from app.models.exception import S2ApiException
 from app.tasks.queue import task_queue
-from app.services.external_id_mapping import external_id_mapping, ExternalIdTypes
+from app.services.external_id_mapping import ExternalIds, external_id_mapping
 
 
 class CorePaperService:
@@ -46,17 +46,17 @@ class CorePaperService:
             disable_cache: 是否禁用缓存，为True时直接从S2 API获取
         """
         try:
+            if disable_cache:
+                logger.debug(f"禁用缓存，直接从S2获取: {paper_id}")
+                return await self._fetch_from_s2(paper_id, fields)
             # 0. 处理外部ID映射
-            resolved_paper_id = await self._resolve_external_id(paper_id)
+            resolved_paper_id = await self.external_mapping.resolve_paper_id(paper_id)
             if resolved_paper_id != paper_id:
                 logger.debug(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
                 paper_id = resolved_paper_id
             else:
                 logger.debug(f"未解析: {paper_id} -> {paper_id}")
             # 如果禁用缓存，直接调用S2 API
-            if disable_cache:
-                logger.debug(f"禁用缓存，直接从S2获取: {paper_id}")
-                return await self._fetch_from_s2(paper_id, fields)
             logger.info(f"get_paper查询: {paper_id}")
             # 1. Redis缓存查询（统一使用 full 视图键）
             full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
@@ -126,7 +126,7 @@ class CorePaperService:
     ) -> Dict[str, Any]:
         """获取论文引用 - 缓存策略"""
         # 0. 处理外部ID映射
-        resolved_paper_id = await self._resolve_external_id(paper_id)
+        resolved_paper_id = await self.external_mapping.resolve_paper_id(paper_id)
         if resolved_paper_id != paper_id:
             logger.debug(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
             paper_id = resolved_paper_id
@@ -223,7 +223,7 @@ class CorePaperService:
     ) -> Dict[str, Any]:
         """获取论文参考文献 - 缓存策略"""
         # 0. 处理外部ID映射
-        resolved_paper_id = await self._resolve_external_id(paper_id)
+        resolved_paper_id = await self.external_mapping.resolve_paper_id(paper_id)
         if resolved_paper_id != paper_id:
             logger.info(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
             paper_id = resolved_paper_id
@@ -659,66 +659,7 @@ class CorePaperService:
         except Exception as e:
             logger.error(f"缓存预热失败 paper_id={paper_id}: {e}")
             return False
-    
-    # 私有方法
-    async def _resolve_external_id(self, paper_id: str) -> str:
-        """解析外部ID，如果是带前缀的外部ID，尝试映射到真实的paper_id"""
-        try:
-            # 检查是否是带前缀的外部ID格式
-            if ":" not in paper_id:
-                return paper_id
-            
-            prefix, external_id = paper_id.split(":", 1)
-            prefix = prefix.upper()
-            
-            # 使用统一的映射方法
-            external_type = ExternalIdTypes.from_prefix(prefix)
-            if not external_type:
-                # 不是已知的外部ID类型，直接返回原值
-                return paper_id
-            logger.info(f"解析外部ID: {external_id}, {external_type}")
-            # 尝试从映射表中查找真实的paper_id
-            mapped_paper_id = await self.external_mapping.get_paper_id(external_id, external_type)
-            if mapped_paper_id:
-                logger.info(f"解析成功外部ID: {external_id}, {external_type}, {mapped_paper_id}")
-                return mapped_paper_id
-            
-            # 映射未命中，返回去掉前缀的外部ID（兼容模式）
-            return external_id
-            
-        except Exception as e:
-            logger.warning(f"外部ID解析失败 {paper_id}: {e}")
-            return paper_id
-    
-    async def _store_external_id_mappings(self, paper_data: Dict[str, Any]) -> None:
-        """存储论文的外部ID映射关系"""
-        try:
-            paper_id = paper_data.get('paperId')
-            if not paper_id:
-                return
-            
-            external_ids = paper_data.get('externalIds', {})
-            if not external_ids:
-                return
-            
-            # 存储各种外部ID的映射关系
-            for id_type, id_value in external_ids.items():
-                if not id_value:
-                    continue
-                
-                # 使用统一的映射方法
-                external_type = ExternalIdTypes.from_s2_api_type(id_type)
-                if external_type:
-                    logger.info(f"存储外部id映射关系: {paper_id}, {id_type}, {id_value}")
-                    await self.external_mapping.set_mapping(
-                        external_id=str(id_value),
-                        external_type=external_type,
-                        paper_id=paper_id
-                    )
-                    
-        except Exception as e:
-            logger.warning(f"存储外部ID映射失败 {paper_data.get('paperId', 'unknown')}: {e}")
-    
+
     def _get_cache_key(self, paper_id: str, fields: Optional[str] = None) -> str:
         """生成缓存键"""
         if fields:
@@ -728,8 +669,7 @@ class CorePaperService:
     async def _get_from_neo4j(self, paper_id: str) -> Optional[Dict]:
         """从Neo4j获取数据"""
         try:
-            # 统一通过 alias 识别优先
-            got = self.neo4j.ensure_fresh(await self.neo4j.get_paper_by_alias(paper_id))
+            got = self.neo4j.ensure_fresh(await self.neo4j.get_paper(paper_id))
             return got
         except Exception as e:
             logger.error(f"Neo4j查询失败 paper_id={paper_id}: {e}")
@@ -853,8 +793,7 @@ class CorePaperService:
            
             logger.info(f"存储外部id映射关系: {paper_id}")
             # 3.5) 存储外部ID映射关系
-            await self._store_external_id_mappings(full_data)
-
+            await self.external_mapping.batch_set_mappings(ExternalIds.from_dict(full_data.get('externalIds', {})), full_data.get('paperId'))
             # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
             async def _async_neo4j_ingest(data):
                 try:

@@ -10,7 +10,7 @@ from loguru import logger
 
 from app.core.config import settings
 from app.models.paper import EnhancedPaper
-from app.utils.title_norm import normalize_title_norm
+from app.services.external_id_mapping import ExternalIds, normalize_title_norm
 
 
 class Neo4jClient:
@@ -77,190 +77,6 @@ class Neo4jClient:
                 logger.error(f"Neo4j获取论文失败 paper_id={paper_id}: {e}")
                 return None
     
-    async def get_paper_by_external_id(self, id_type: str, id_value: str) -> Optional[Dict]:
-        """根据外部ID获取论文，使用新的单独属性方案"""
-        if self.driver is None:
-            return None
-        # 统一使用 externalIds JSON 字段查询（除了特殊处理的字段）
-        if id_type == "TITLE_NORM":
-            # 标题归一化仍使用单独属性
-            query = "MATCH (p:Paper) WHERE p.title_norm = $id_value RETURN p"
-            query_params = {"id_value": id_value}
-        else:
-            # 其他所有外部ID都从 externalIds JSON 字段中查询
-            query = """
-            MATCH (p:Paper) 
-            WHERE p.externalIds IS NOT NULL 
-            AND apoc.convert.fromJsonMap(p.externalIds)[$id_type] = $id_value 
-            RETURN p
-            """
-            query_params = {"id_type": id_type, "id_value": id_value}
-        
-        async with self.driver.session(database=settings.neo4j_database) as session:
-            try:
-                result = await session.run(query, **query_params)
-                record = await result.single()
-                if record:
-                    paper_node = record["p"]
-                    node_props = dict(paper_node)
-                    data_json = node_props.get("dataJson")
-                    if isinstance(data_json, str) and data_json:
-                        try:
-                            payload = json.loads(data_json)
-                            if node_props.get("lastUpdated") is not None:
-                                payload["lastUpdated"] = node_props.get("lastUpdated")
-                            return payload
-                        except Exception:
-                            return node_props
-                    return node_props
-                return None
-            except Exception as e:
-                logger.error(f"Neo4j根据外部ID获取论文失败 {id_type}={id_value}: {e}")
-                return None
-
-    async def get_paper_by_alias(self, raw_identifier: str) -> Optional[Dict]:
-        """根据输入自动识别并通过别名/ID获取论文。
-
-        识别顺序（精确优先）：
-        - 显式前缀：DOI:/ARXIV:/MAG:/ACL:/PMID:/PMCID:/CorpusId:/URL:
-        - DOI (以 10. 开头)
-        - URL (http/https)
-        - ArXiv (包含 arxiv 或 形如 1234.56789/v2)
-        - CorpusId (纯数字)
-        - S2 sha（40位十六进制）
-        - 直接当作 paperId 尝试
-        - TITLE_NORM（强匹配，不做模糊）
-        """
-        try:
-            if self.driver is None:
-                return None
-            s = (raw_identifier or "").strip()
-            if not s:
-                return None
-
-            # 1) 解析显式类型前缀：TYPE:value
-            if ":" in s:
-                head, tail = s.split(":", 1)
-                t = head.strip().upper()
-                v = tail.strip()
-                if t == "DOI":
-                    norm = self._normalize_doi(v)
-                    if norm:
-                        hit = await self.get_paper_by_external_id("DOI", norm)
-                        if hit:
-                            return hit
-                elif t in ("ARXIV", "ARXIv"):
-                    norm = self._normalize_arxiv(v)
-                    if norm:
-                        hit = await self.get_paper_by_external_id("ArXiv", norm)
-                        if hit:
-                            return hit
-                elif t in ("CORPUSID", "CORPUS"):
-                    norm = self._normalize_corpus_id(v)
-                    if norm is not None:
-                        hit = await self.get_paper_by_external_id("CorpusId", norm)
-                        if hit:
-                            return hit
-                elif t == "MAG":
-                    norm = self._normalize_mag(v)
-                    if norm is not None:
-                        hit = await self.get_paper_by_external_id("MAG", norm)
-                        if hit:
-                            return hit
-                elif t == "ACL":
-                    norm = self._normalize_acl(v)
-                    if norm:
-                        hit = await self.get_paper_by_external_id("ACL", norm)
-                        if hit:
-                            return hit
-                elif t == "PMID":
-                    norm = self._normalize_pmid(v)
-                    if norm is not None:
-                        hit = await self.get_paper_by_external_id("PMID", norm)
-                        if hit:
-                            return hit
-                elif t == "PMCID":
-                    norm = self._normalize_pmcid(v)
-                    if norm is not None:
-                        hit = await self.get_paper_by_external_id("PMCID", norm)
-                        if hit:
-                            return hit
-                elif t == "URL":
-                    norm = self._normalize_url(v)
-                    if norm:
-                        hit = await self.get_paper_by_external_id("URL", norm)
-                        if hit:
-                            return hit
-
-            # DOI
-            if s.startswith("10."):
-                v = self._normalize_doi(s)
-                if v:
-                    found = await self.get_paper_by_external_id("DOI", v)
-                    if found:
-                        return found
-
-            # URL
-            if s.lower().startswith("http"):
-                v = self._normalize_url(s)
-                if v:
-                    found = await self.get_paper_by_external_id("URL", v)
-                    if found:
-                        return found
-                # 兼容路径末尾含斜杠与无查询的轻微差异：再尝试去除末尾斜杠
-                try:
-                    if v and v.endswith('/'):
-                        v2 = v[:-1]
-                        found = await self.get_paper_by_external_id("URL", v2)
-                        if found:
-                            return found
-                except Exception:
-                    pass
-
-            # ArXiv
-            low = s.lower()
-            import re as _re
-            if "arxiv" in low or _re.match(r"^\d{4}\.\d{4,5}(v\d+)?$", s):
-                v = self._normalize_arxiv(s)
-                if v:
-                    found = await self.get_paper_by_external_id("ArXiv", v)
-                    if found:
-                        return found
-
-            # CorpusId（纯数字）
-            if s.isdigit():
-                try:
-                    v = self._normalize_corpus_id(s)
-                    found = await self.get_paper_by_external_id("CorpusId", v)
-                    if found:
-                        return found
-                except Exception:
-                    pass
-
-            # S2 sha（40位十六进制）
-            try:
-                import re as _re2
-                if _re2.fullmatch(r"[0-9a-fA-F]{40}", s):
-                    direct = await self.get_paper(s)
-                    if direct:
-                        return direct
-            except Exception:
-                pass
-
-            # 直接按 paperId 获取
-            direct = await self.get_paper(s)
-            if direct:
-                return direct
-
-            # 最后尝试 TITLE_NORM（存储在externalIds map中）
-            tnorm = self._normalize_title_norm(s)
-            if tnorm:
-                title_hit = await self.get_paper_by_external_id("TITLE_NORM", tnorm)
-                if title_hit:
-                    return title_hit
-        except Exception as e:
-            logger.error(f"根据别名获取论文失败 id={raw_identifier}: {e}")
-        return None
     
     async def find_papers_by_title_norm_contains(self, title_fragment: str, limit: int = 3) -> List[Dict]:
         """按 TITLE_NORM contains/prefix 做轻量模糊匹配，返回若干候选。
@@ -272,7 +88,7 @@ class Neo4jClient:
                 return []
             if not title_fragment or not isinstance(title_fragment, str):
                 return []
-            norm = self._normalize_title_norm(title_fragment)
+            norm = normalize_title_norm(title_fragment)
             if not norm:
                 return []
             cypher = """
@@ -414,27 +230,11 @@ class Neo4jClient:
             return
             
         # 归一化所有外部ID
-        normalized_external_ids = {}
-        
-        for id_type, id_value in external_ids.items():
-            if not id_value:
-                continue
-                
-            # 归一化值
-            normalized_value = self._normalize_external_id(id_type, id_value)
-            if normalized_value:
-                normalized_external_ids[id_type] = normalized_value
-        
+        normalized_external_ids = ExternalIds.from_dict(external_ids)
         # 将归一化后的外部ID存储为JSON字符串，并同步 title_norm（若提供）
         if normalized_external_ids:
-            external_ids_json = json.dumps(normalized_external_ids, ensure_ascii=False)
-            title_norm_value = None
-            try:
-                raw_title = external_ids.get("TITLE_NORM") or external_ids.get("title")
-                if raw_title:
-                    title_norm_value = normalize_title_norm(str(raw_title))
-            except Exception:
-                title_norm_value = None
+            external_ids_json = normalized_external_ids.to_json()
+            title_norm_value = normalized_external_ids.get("TITLE_NORM")
 
             query = """
             MATCH (p:Paper {paperId: $paper_id})
@@ -443,7 +243,7 @@ class Neo4jClient:
             params = {"paper_id": paper_id, "external_ids_json": external_ids_json}
             if title_norm_value:
                 query += ", p.title_norm = $title_norm"
-                params["title_norm"] = title_norm_value
+                params["title_norm"] = title_norm_value.external_id
             try:
                 await session.run(query, **params)
                 logger.debug(f"更新外部ID成功 paper_id={paper_id}, 外部ID数量={len(normalized_external_ids)}")
@@ -704,102 +504,7 @@ class Neo4jClient:
             logger.error(f"创建Citations抓取计划失败 paper_id={paper_id}: {e}")
             return False
 
-    def _normalize_doi(self, doi: str) -> Optional[str]:
-        try:
-            value = doi.strip().lower()
-            return value if value else None
-        except Exception:
-            return None
-
-    def _normalize_arxiv(self, arxiv_id: str) -> Optional[str]:
-        try:
-            import re
-            s = str(arxiv_id).strip()
-            # 去除大小写不敏感前缀
-            s = re.sub(r"(?i)^arxiv:", "", s).strip()
-            # 去除末尾版本标记 vN / VN
-            s = re.sub(r"(?i)v\d+$", "", s).strip()
-            # 提取标准新格式 1234.56789（4位.4-5位）
-            m = re.match(r"^\d{4}\.\d{4,5}$", s)
-            if m:
-                return s
-            m2 = re.search(r"(\d{4}\.\d{4,5})", s)
-            if m2:
-                return m2.group(1)
-            return s if s else None
-        except Exception:
-            return None
-
-    def _normalize_url(self, url: str) -> Optional[str]:
-        try:
-            from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-            u = urlparse(url.strip())
-            scheme = u.scheme.lower() or 'http'
-            netloc = u.netloc.lower()
-            path = u.path.rstrip('/') or '/'
-            # 过滤追踪参数
-            q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=False) if not k.lower().startswith('utm_')]
-            query = urlencode(q)
-            return urlunparse((scheme, netloc, path, '', query, ''))
-        except Exception:
-            return None
-
-    def _normalize_title_norm(self, title: str) -> Optional[str]:
-        # Deprecated: keep for backward compatibility; delegate to util
-        return normalize_title_norm(title)
-
-    def _normalize_external_id(self, id_type: str, value: Any) -> Optional[str]:
-        """统一的外部ID归一化方法"""
-        try:
-            if id_type == "DOI":
-                return self._normalize_doi(str(value))
-            elif id_type == "ArXiv":
-                return self._normalize_arxiv(str(value))
-            elif id_type == "CorpusId":
-                return self._normalize_corpus_id(value)
-            elif id_type == "MAG":
-                return self._normalize_mag(value)
-            elif id_type == "ACL":
-                return self._normalize_acl(str(value))
-            elif id_type == "PMID":
-                return self._normalize_pmid(value)
-            elif id_type == "PMCID":
-                return self._normalize_pmcid(value)
-            elif id_type == "URL":
-                return self._normalize_url(str(value))
-            else:
-                # 未知类型，直接返回字符串形式
-                return str(value).strip() if value else None
-        except Exception:
-            return None
-    
-    def _normalize_corpus_id(self, value: Any) -> str:
-        return str(int(value))
-
-    def _normalize_mag(self, value: Any) -> str:
-        return str(int(value))
-
-    def _normalize_pmid(self, value: Any) -> str:
-        return str(int(value))
-
-    def _normalize_pmcid(self, value: Any) -> str:
-        # 接受 "2323736" 或 "PMC2323736"，统一为数字字符串
-        try:
-            s = str(value).strip().upper()
-            if s.startswith('PMC'):
-                s = s[3:]
-            return str(int(s))
-        except Exception:
-            return str(int(value))
-
-    def _normalize_acl(self, value: str) -> Optional[str]:
-        try:
-            v = value.strip().upper()
-            # 规范化连字符等
-            v = v.replace('_', '-').replace(' ', '')
-            return v if v else None
-        except Exception:
-            return None
+    # 本地归一化/别名逻辑已移除，统一使用 external_id_mapping
     
     async def create_citation_relation(self, citing_paper_id: str, cited_paper_id: str) -> bool:
         """创建引用关系"""
@@ -1042,6 +747,8 @@ class Neo4jClient:
             return False
     def ensure_fresh(self, data: Dict) -> Dict:
         """确保数据新鲜"""
+        if not data:
+            return None
         if not self._is_data_fresh(data.get('lastUpdated')):
             return None
         return data

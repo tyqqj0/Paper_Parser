@@ -1,5 +1,5 @@
 # Paper Parser项目管理
-.PHONY: help build up down start stop restart restart-api logs clean clean-data clean-redis clean-neo4j status shell arq-logs
+.PHONY: help build up down start stop restart restart-api logs set-log-level clean clean-data clean-redis clean-neo4j status shell arq-logs
 
 # 默认目标
 help:
@@ -12,6 +12,7 @@ help:
 	@echo "  restart-api - 仅重启API服务"
 	@echo "  infra      - 仅启动基础服务 (Redis + Neo4j)"
 	@echo "  logs       - 查看所有服务日志"
+	@echo "  set-log-level - 修改日志等级（LEVEL=INFO/DEBUG/WARNING/ERROR）"
 	@echo "  arq-logs   - 查看ARQ Worker日志"
 	@echo "  status     - 查看服务状态"
 	@echo "  shell      - 进入API容器"
@@ -75,6 +76,14 @@ restart-api:
 # 查看所有服务日志
 logs:
 	docker compose logs -f
+
+# 修改 Compose 使用的日志等级（只写入 .env，不自动重启）
+set-log-level:
+	@[ -n "$(LEVEL)" ] || { echo "请提供 LEVEL=INFO/DEBUG/WARNING/ERROR"; exit 1; }
+	@echo "设置日志等级为 $(LEVEL) 到 .env ..."
+	@touch .env
+	@grep -q '^LOG_LEVEL=' .env && sed -i 's/^LOG_LEVEL=.*/LOG_LEVEL=$(LEVEL)/' .env || echo "LOG_LEVEL=$(LEVEL)" >> .env
+	@echo "完成。请手动重启：docker compose restart 或 make restart"
 
 # 查看ARQ Worker日志
 arq-logs:
