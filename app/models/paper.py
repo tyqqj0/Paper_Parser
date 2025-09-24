@@ -14,7 +14,12 @@ class PaperFieldsConfig:
     论文字段配置 - 基于官方SDK的完整字段列表
     用于动态构建API请求和缓存策略
     """
-    
+    ATOMIC_DOTTED_FIELDS = [
+        'embedding.specter_v2'
+    ]
+    EMBEDDING_FIELDS = [
+        'embedding.specter_v2'
+    ]
     # 核心字段 - 最常用，优先缓存
     CORE_FIELDS = [
         'paperId', 'title', 'abstract', 'year', 'authors',
@@ -69,7 +74,43 @@ class PaperFieldsConfig:
                    cls.AUTHOR_FIELDS + cls.CITATION_FIELDS + cls.REFERENCE_FIELDS)
         else:
             return cls.CORE_FIELDS
-
+    @classmethod
+    def param_str_to_list(cls, param) -> Optional[List[str]]:
+        """将参数转换为列表"""
+        if param is None:
+            return None
+        if isinstance(param, str):
+            return [p.strip() for p in param.split(',')]
+        return param
+    @classmethod
+    def param_list_to_str(cls, param) -> Optional[str]:
+        """将参数转换为字符串"""
+        if param is None:
+            return None
+        if isinstance(param, list):
+            return ','.join(param)
+        return param
+    @classmethod
+    def get_normal_fields(cls) -> List[str]:
+        return cls.get_fields_for_level('extended')+cls.EMBEDDING_FIELDS
+    @classmethod
+    def normalize_fields(cls,fields=None) -> List[str]:
+        if fields:
+            fields = cls.param_str_to_list(fields)
+            return list(set(cls.param_str_to_list(fields)+cls.get_normal_fields()))
+        else:   
+            return cls.get_normal_fields()
+    @classmethod
+    def is_in_noraml_fields(cls,fields=None) -> bool:
+        if not fields:
+            return True
+        fields = cls.param_str_to_list(fields)
+        return set(fields).issubset(set(cls.get_normal_fields()))
+    @classmethod
+    def remove_relations_fields(cls, fields: List[str]) -> List[str]:
+        """移除关系字段"""
+        return [f for f in fields if not f.startswith('citations') and not f.startswith('references')]
+    
 
 class EnhancedPaper(BaseModel):
     """

@@ -17,10 +17,11 @@ class PaginatedResults:
                 data_type: Any,
                 url: str,
                 query: str = None,
-                fields: str = None,
+                fields: list = None,
                 limit: int = None,
                 headers: dict = None,
-                max_results: int = 10000
+                max_results: int = 10000,
+                offset: int = 0
             ) -> None:
 
         self._requester = requester
@@ -34,8 +35,8 @@ class PaginatedResults:
 
         self._data = []
         self._total = 0
-        self._offset = 0 - self._limit
-        self._next = 0
+        self._offset = offset - self._limit
+        self._next = offset
         self._parameters = ''
         self._items = []
         self._continuation_token = None

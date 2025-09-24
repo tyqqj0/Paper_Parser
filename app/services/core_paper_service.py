@@ -46,6 +46,8 @@ class CorePaperService:
             disable_cache: 是否禁用缓存，为True时直接从S2 API获取
         """
         try:
+            if not PaperFieldsConfig.is_in_noraml_fields(fields):
+                disable_cache = True
             if disable_cache:
                 logger.debug(f"禁用缓存，直接从S2获取: {paper_id}")
                 return await self._fetch_from_s2(paper_id, fields)
@@ -72,7 +74,7 @@ class CorePaperService:
                 logger.debug(f"Neo4j数据命中: {paper_id}")
                 
                 # 异步更新Redis缓存
-                await task_queue.enqueue_set_paper_cache(paper_id, neo4j_data, None)
+                await redis_client.set_paper(paper_id, neo4j_data, None)
                 
                 return self._format_response(neo4j_data, fields)
             """
@@ -168,11 +170,9 @@ class CorePaperService:
             citations_data = await self.s2.get_paper_citations(
                 paper_id, limit, offset, fields_list
             )
-            
             # 标准化空结果，避免缓存None
             if not citations_data:
                 citations_data = {
-                    'total': 0,
                     'offset': offset,
                     'data': []
                 }
@@ -180,7 +180,6 @@ class CorePaperService:
                 logger.info(f"S2 API获取引用: {paper_id}")
             # 统一输出字段（对齐S2：使用 data 键）
             shaped = {
-                'total': citations_data.get('total', 0),
                 'offset': citations_data.get('offset', offset),
                 'data': citations_data.get('data', []),
             }
@@ -326,7 +325,6 @@ class CorePaperService:
         except Exception as e:
             logger.error(f"获取参考文献失败 paper_id={paper_id}: {e}")
             raise HTTPException(status_code=500, detail="内部服务器错误")
-    
     async def search_papers(
         self,
         query: str,
@@ -380,19 +378,11 @@ class CorePaperService:
         
         try:
             # 处理fields参数 - 转换为列表格式
-            fields_list = None
-            if fields:
-                fields_list = [f.strip() for f in fields.split(',')]
-            
+            fields_list = self.s2.param_str_to_list(fields)
             # 处理venue和fields_of_study参数 - 转换为列表格式
-            venue_list = None
-            if venue:
-                venue_list = [v.strip() for v in venue.split(',')]
-                
-            fields_of_study_list = None
-            if fields_of_study:
-                fields_of_study_list = [f.strip() for f in fields_of_study.split(',')]
-            
+            venue_list = self.s2.param_str_to_list(venue)
+            fields_of_study_list = self.s2.param_str_to_list(fields_of_study)
+            """
             # 标题精准匹配模式（最多返回1条）
             if match_title:
                 if prefer_local:
@@ -430,27 +420,17 @@ class CorePaperService:
                         fields_of_study=None,
                         match_title=True,
                     )
-                else:
-                    search_results = {
-                        'total': 0,
-                        'offset': 0,
-                        'data': []
-                    }
-
                 if not search_results:
                     search_results = {
                         'total': 0,
                         'offset': 0,
                         'data': []
                     }
-
                 shaped = {
                     'total': search_results.get('total', 0),
                     'offset': 0,
                     'papers': search_results.get('data', [])[:1],
                 }
-                shaped['data'] = shaped['papers']
-
                 # 异步触发按paper端点逻辑的全量抓取与入库，避免部分字段不一致
                 try:
                     top_items = shaped.get('papers') or []
@@ -463,8 +443,7 @@ class CorePaperService:
 
                 await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
                 return shaped
-            
-            # prefer_local：优先使用本地Neo4j全文索引
+            """
             if prefer_local:
                 try:
                     local_hits = await self.neo4j.search_papers(query=query, limit=limit, offset=offset)
@@ -483,28 +462,18 @@ class CorePaperService:
                     shaped_local['data'] = shaped_local['papers']
                     await self.redis.set(cache_key, shaped_local, settings.cache_search_ttl)
                     return shaped_local
-
-                # 若本地未命中且不允许回退，则直接返回空结果
-                if not fallback_to_s2:
-                    empty_shaped = {
-                        'total': 0,
-                        'offset': offset,
-                        'papers': [],
-                    }
-                    empty_shaped['data'] = empty_shaped['papers']
-                    await self.redis.set(cache_key, empty_shaped, settings.cache_search_ttl)
-                    return empty_shaped
-
+            if fallback_to_s2:
             # 从S2 API搜索
-            search_results = await self.s2.search_papers(
-                query=query,
-                offset=offset,
-                limit=limit,
-                fields=fields_list,
-                year=year,
-                venue=venue_list,
-                fields_of_study=fields_of_study_list
-            )
+                search_results = await self.s2.search_papers(
+                    query=query,
+                    offset=offset,
+                    limit=limit,
+                    fields=fields_list,
+                    year=year,
+                    venue=venue_list,
+                    fields_of_study=fields_of_study_list,
+                    match_title=match_title
+                )
             
             # 标准化真正的空结果（上游成功但无数据）
             if not search_results:
@@ -521,8 +490,6 @@ class CorePaperService:
                 'offset': search_results.get('offset', offset),
                 'papers': search_results.get('data', []),
             }
-            # 兼容字段：同时暴露 data 键，满足历史测试/脚本
-            shaped['data'] = shaped['papers']
 
             # 缓存搜索结果
             await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
@@ -581,9 +548,7 @@ class CorePaperService:
         if uncached_ids:
             try:
                 # 处理fields参数 - 转换为列表格式
-                fields_list = None
-                if fields:
-                    fields_list = [f.strip() for f in fields.split(',')]
+                fields_list = self.s2.param_str_to_list(fields)
                 
                 batch_ids = [pid for _, pid in uncached_ids]
                 batch_data = await self.s2.get_papers_batch(batch_ids, fields_list)
@@ -640,9 +605,7 @@ class CorePaperService:
         """预热指定论文的缓存"""
         try:
             # 处理fields参数 - 转换为列表格式
-            fields_list = None
-            if fields:
-                fields_list = [f.strip() for f in fields.split(',')]
+            fields_list = self.s2.param_str_to_list(fields)
             
             # 强制从S2获取最新数据
             paper_data = await self.s2.get_paper(paper_id, fields_list)
@@ -676,12 +639,24 @@ class CorePaperService:
             return None
 
     def _build_field_tree(self, fields: str) -> Dict[str, Dict]:
-        """将逗号分隔的字段列表构建为嵌套字段树，支持 authors.name 这类路径"""
+        """将逗号分隔的字段列表构建为嵌套字段树，支持 authors.name 这类路径。
+        对于像 embedding.specter_v2 这样的点号字段，视为整体字段名，不做拆分。
+        """
         field_tree: Dict[str, Dict] = {}
         for raw in fields.split(','):
             part = raw.strip()
             if not part:
                 continue
+            # 若为原子点号字段，直接作为顶层键
+            is_atomic = False
+            for atomic in PaperFieldsConfig.ATOMIC_DOTTED_FIELDS:
+                if part == atomic or part.startswith(atomic + '.'):
+                    field_tree[atomic.split('.')[0]] = {}
+                    is_atomic = True
+                    break
+            if is_atomic:
+                continue
+            # 默认：按路径拆分构建树
             node = field_tree
             for token in part.split('.'):
                 node = node.setdefault(token, {})
@@ -706,10 +681,11 @@ class CorePaperService:
         # 基础类型，无法继续下钻，直接返回
         return value
 
-    def _format_response(self, data: Dict, fields: Optional[str] = None) -> Dict:
+    def _format_response(self, data: Dict, fields= None) -> Dict:
         """格式化响应数据，支持嵌套字段路径裁剪（如 authors.name、citations.title）。"""
         if not fields:
             return data
+        fields=PaperFieldsConfig.param_list_to_str(fields)
         try:
             field_tree = self._build_field_tree(fields)
             # 始终包含 paperId 以对齐S2并便于调用方识别
@@ -743,44 +719,14 @@ class CorePaperService:
         await self.redis.set_task_status(paper_id, "processing")
 
         try:
+            #if not fields:
+            #    fields = PaperFieldsConfig.get_fields_for_level('extended')
             # 1) 抓取主体（扩展级，不包含大列表）
-            body = await self._fetch_paper_body_full(paper_id)
+            if not fields:
+                fields = PaperFieldsConfig.get_fields_for_level('extended')
+            body = await self._fetch_paper_body_full(paper_id,fields)
             if not body:
                 raise HTTPException(status_code=404, detail=f"论文不存在: {paper_id}")
-            """
-            # 2) 判断是否需要抓取关系
-            should_fetch_citations = False
-            should_fetch_references = True
-            if fields:
-                requested = {f.strip() for f in fields.split(',') if f.strip()}
-                if 'citations' in requested:
-                    should_fetch_citations = True
-                if 'references' in requested:
-                    should_fetch_references = True
-            # 若计数不大，也进行全量抓取以便后续直接切片
-            try:
-                if isinstance(body.get('citationCount'), int) and body['citationCount'] <= self.relations_full_fetch_threshold:
-                    should_fetch_citations = True
-                if isinstance(body.get('referenceCount'), int) and body['referenceCount'] <= self.relations_full_fetch_threshold:
-                    should_fetch_references = True
-            except Exception:
-                pass
-            # 全局开关强制抓取（即使超过阈值）
-            try:
-                if getattr(settings, 'force_fetch_citations', False):
-                    should_fetch_citations = True
-                if getattr(settings, 'force_fetch_references', False):
-                    should_fetch_references = True
-            except Exception:
-                pass
-            relations: Dict[str, Any] = {}
-            if should_fetch_citations or should_fetch_references:
-                relations = await self._fetch_relations_segmented(
-                    paper_id,
-                    fetch_citations=should_fetch_citations,
-                    fetch_references=should_fetch_references
-                )
-            """
             #2) 抓取引用,不抓取被引
             relations = await self._fetch_relations_segmented(
                     paper_id,
@@ -789,54 +735,20 @@ class CorePaperService:
                 )
             # 3) 合并并写缓存
             full_data = {**body, **relations}
-            await self.redis.set_paper(paper_id, full_data, None)
+            await self.redis.set_paper(paper_id, full_data, fields)
            
             logger.info(f"存储外部id映射关系: {paper_id}")
             # 3.5) 存储外部ID映射关系
             await self.external_mapping.batch_set_mappings(ExternalIds.from_dict(full_data.get('externalIds', {})), full_data.get('paperId'))
             # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
-            async def _async_neo4j_ingest(data):
-                try:
-                    # 未连接Neo4j时静默跳过
-                    if getattr(self.neo4j, "driver", None) is None:
-                        logger.info("Neo4j未连接，跳过异步入库")
-                        return
-                    ok = await self.neo4j.merge_paper(data)
-                    if not ok:
-                        return
-                    #从顶层 corpusId、url、title 补全并规范化为 externalIds
-                    await self.neo4j.merge_aliases_from_paper(data)
-                    await self.neo4j.merge_data_chunks_from_full_data(data)
-                    # 根据是否已抓取关系决定是否立即合并 CITES，并为大规模被引创建计划
-                    try:
-                        c_count = int(data.get('citationCount') or 0)
-                    except Exception:
-                        c_count = 0
-                    try:
-                        r_count = int(data.get('referenceCount') or 0)
-                    except Exception:
-                        r_count = 0
-                    await self.neo4j.merge_cites_from_full_data(data)
-                    """
-                    # 若任一关系已抓取，则直接落库对应的 CITES 边
-                    if should_fetch_citations or should_fetch_references:
-                        await self.neo4j.merge_cites_from_full_data(data)
-
-                    # 若被引量大且本次未抓取，则创建分页抓取计划（避免 else 误判）
-                    if (not should_fetch_citations) and c_count > self.relations_full_fetch_threshold:
-                        await self.neo4j.create_citations_ingest_plan(
-                            data.get('paperId'), c_count, self.relations_page_size
-                        )
-                    """
-                except Exception as e:
-                    logger.error(f"异步Neo4j入库失败 paper_id={data.get('paperId')}: {e}")
-            
-            # 入队后台 Neo4j 入库任务（除非在ARQ worker环境中）
+            # 检查是否在ARQ worker环境中
             if not skip_neo4j_enqueue:
                 await task_queue.enqueue_neo4j_merge(full_data)
-
+            else:
+                await self.neo4j.merge_paper_full(full_data)
             logger.info(f"从S2获取数据成功: {paper_id}")
-            return full_data if not fields else self._format_response(full_data, fields)
+            self._format_response(full_data, fields)
+            return self._format_response(full_data, fields)
         except HTTPException:
             # 标记失败，避免遗留processing状态导致后续408
             try:
@@ -857,13 +769,11 @@ class CorePaperService:
                 await self.redis.delete_task_status(paper_id)
             except Exception:
                 pass
-
-    async def _fetch_paper_body_full(self, paper_id: str) -> Optional[Dict[str, Any]]:
+    
+    async def _fetch_paper_body_full(self, paper_id: str,fields: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """抓取论文主体（扩展级字段，不包含大列表关系）。"""
         try:
-            fields_list = PaperFieldsConfig.get_fields_for_level('extended')
-            # 移除关系字段，避免大列表
-            fields_list = [f for f in fields_list if not f.startswith('citations') and not f.startswith('references')]
+            fields_list = PaperFieldsConfig.remove_relations_fields(PaperFieldsConfig.normalize_fields(fields))
             return await self.s2.get_paper(paper_id, fields_list)
         except Exception as e:
             logger.error(f"抓取论文主体失败 paper_id={paper_id}: {e}")
@@ -883,6 +793,7 @@ class CorePaperService:
                 citations: List[Dict[str, Any]] = []
                 offset = 0
                 while True:
+                    logger.info(f"分页抓取被引用: {paper_id}, offset={offset}, limit={self.relations_page_size}")
                     chunk = await self.s2.get_paper_citations(
                         paper_id,
                         limit=self.relations_page_size,
@@ -891,9 +802,8 @@ class CorePaperService:
                     )
                     data = (chunk or {}).get('data', [])
                     citations.extend(data)
-                    total = (chunk or {}).get('total', 0)
                     offset += self.relations_page_size
-                    if not data or len(citations) >= total:
+                    if not data:
                         break
                 result['citations'] = citations
 
@@ -909,9 +819,10 @@ class CorePaperService:
                     )
                     data = (chunk or {}).get('data', [])
                     references.extend(data)
-                    total = (chunk or {}).get('total', 0)
                     offset += self.relations_page_size
-                    if not data or len(references) >= total:
+                    total=len(references)
+                    print(f"分页抓取参考文献: {paper_id}, offset={offset}, limit={self.relations_page_size}, total={total}")
+                    if not data:
                         break
                 result['references'] = references
         except Exception as e:

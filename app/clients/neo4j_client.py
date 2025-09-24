@@ -119,7 +119,21 @@ class Neo4jClient:
         except Exception as e:
             logger.error(f"TITLE_NORM contains 匹配失败 fragment='{title_fragment}': {e}")
             return []
-    
+    async def merge_paper_full(self, paper_data: Dict) -> bool:
+        """从 full_data 合并论文数据"""
+        if self.driver is None:
+            return False
+        ok = await self.merge_paper(paper_data)
+        if not ok:
+            return False
+        ok = await self.merge_aliases_from_paper(paper_data)
+        if not ok:
+            return False
+        ok = await self.merge_data_chunks_from_full_data(paper_data)
+        if not ok:
+            return False
+        ok = await self.merge_cites_from_full_data(paper_data)
+        return ok
     async def merge_paper(self, paper_data: Dict) -> bool:
         """插入或更新论文数据"""
         if self.driver is None:
@@ -149,7 +163,9 @@ class Neo4jClient:
                     return False
                 
                 # 分离JSON数据和属性
-                data_json = json.dumps(paper_data, ensure_ascii=False, default=str)
+                # 创建不包含embedding属性的副本用于JSON序列化
+                paper_data_for_json = {k: v for k, v in paper_data.items() if k != "embedding"}
+                data_json = json.dumps(paper_data_for_json, ensure_ascii=False, default=str)
                 authors_value = paper_data.get("authors")
                 authors_json = None
                 try:
@@ -182,6 +198,16 @@ class Neo4jClient:
                     else:
                         # 其他非原始类型一律忽略，完整对象已写入 dataJson
                         continue
+                # 提取并展开 embedding.specter_v2.vector 为节点属性 embedding_specter_v2
+                try:
+                    embedding_obj = paper_data.get("embedding")
+                    if isinstance(embedding_obj, dict):
+                        if embedding_obj.get("model") == "specter_v2":
+                            vector_candidate = embedding_obj.get("vector")
+                            if isinstance(vector_candidate, list) and vector_candidate and all(isinstance(x, (int, float)) for x in vector_candidate):
+                                properties["embedding_specter_v2"] = [float(x) for x in vector_candidate]
+                except Exception:
+                    pass
                 
                 # 计算并传递 title_norm（如果有标题）
                 title_norm = None
@@ -331,29 +357,12 @@ class Neo4jClient:
             paper_id = paper_data.get("paperId")
             if not paper_id:
                 return False
-
-            # 准备 JSON（字符串）
-            metadata = {
-                k: v for k, v in paper_data.items() if k not in ("citations", "references")
-            }
-            metadata_json = json.dumps(metadata, ensure_ascii=False, default=str)
-
             citations = paper_data.get("citations") if isinstance(paper_data.get("citations"), list) else None
             references = paper_data.get("references") if isinstance(paper_data.get("references"), list) else None
             citations_json = json.dumps(citations, ensure_ascii=False, default=str) if citations is not None else None
             references_json = json.dumps(references, ensure_ascii=False, default=str) if references is not None else None
 
             async with self.driver.session(database=settings.neo4j_database) as session:
-                # metadata - 直接存储到Paper节点属性中
-                try:
-                    q = """
-                    MATCH (p:Paper {paperId: $paper_id})
-                    SET p.metadataJson = $metadata_json, p.metadataUpdated = datetime()
-                    """
-                    await session.run(q, paper_id=paper_id, metadata_json=metadata_json)
-                except Exception as e:
-                    logger.error(f"写入metadata到Paper节点失败 paper_id={paper_id}: {e}")
-
                 # citations
                 if citations_json is not None:
                     try:

@@ -61,25 +61,7 @@ async def fetch_from_s2(ctx: Dict[str, Any], paper_id: str, fields: Optional[str
 
 async def neo4j_merge(ctx: Dict[str, Any], full_data: Dict[str, Any]) -> bool:
     """后台合并论文节点、别名、数据块及关系/计划。"""
-    try:
-        ok = await neo4j_client.merge_paper(full_data)
-        if not ok:
-            return False
-        await neo4j_client.merge_aliases_from_paper(full_data)
-        await neo4j_client.merge_data_chunks_from_full_data(full_data)
-        try:
-            await neo4j_client.merge_cites_from_full_data(full_data)
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        safe_id = None
-        try:
-            safe_id = full_data.get("paperId")
-        except Exception:
-            pass
-        logger.error(f"ARQ neo4j_merge 执行失败 paper_id={safe_id}: {e}")
-        return False
+    return await neo4j_client.merge_paper_full(full_data)
 
 
 # 绑定生命周期钩子
@@ -87,20 +69,10 @@ WorkerSettings.on_startup = startup  # type: ignore[attr-defined]
 WorkerSettings.on_shutdown = shutdown  # type: ignore[attr-defined]
 
 
-async def set_paper_cache(ctx: Dict[str, Any], paper_id: str, data: Dict[str, Any], fields: Optional[str] = None) -> bool:
-    """后台设置论文缓存。"""
-    try:
-        return await redis_client.set_paper(paper_id, data, fields)
-    except Exception as e:
-        logger.error(f"ARQ set_paper_cache 执行失败 paper_id={paper_id}: {e}")
-        return False
-
-
 # 使用可调用对象注册任务函数，确保与 enqueue_job('function_name') 匹配
 WorkerSettings.functions = [
     fetch_from_s2,
     neo4j_merge,
-    set_paper_cache,
 ]
 
 

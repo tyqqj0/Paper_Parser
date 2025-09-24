@@ -6,6 +6,8 @@ import hashlib
 import json
 import asyncio
 from loguru import logger
+
+from app.models.paper import PaperFieldsConfig
 from ..utils.semanticscholar import AsyncSemanticScholar
 from ..utils.semanticscholar import Paper as S2Paper
 from ..utils.semanticscholar import Author as S2Author
@@ -105,13 +107,7 @@ class S2SDKClient:
         try:
             # 使用默认字段或自定义字段
             if not fields:
-                fields = [
-                    'paperId', 'title', 'abstract', 'year', 'authors',
-                    'citationCount', 'referenceCount', 'influentialCitationCount',
-                    'fieldsOfStudy', 's2FieldsOfStudy', 'publicationDate',
-                    'journal', 'venue', 'externalIds', 'url', 'openAccessPdf',
-                    'publicationVenue', 'publicationTypes', 'isOpenAccess'
-                ]
+                fields = PaperFieldsConfig.CORE_FIELDS
             
             logger.debug(f"[S2 DEBUG] 使用字段: {fields}")
             logger.info(f"[S2 API] 调用获取论文接口 - paper_id='{paper_id}'")
@@ -192,39 +188,15 @@ class S2SDKClient:
                 ]
             
             logger.debug(f"[S2 DEBUG] 使用字段: {fields}")
-            
-            # 标题精准匹配模式：返回最佳1条
-            if match_title:
-                logger.info(f"[S2 API] 调用精准匹配接口 - query='{query}'")
-                paper = await self.client.search_paper(
-                    query=query,
-                    limit=1,
-                    fields=fields,
-                    match_title=True
-                )
-                if paper:
-                    return {
-                        'total': 1,
-                        'offset': 0,
-                        'data': [paper.raw_data]
-                    }
-                return {
-                    'total': 0,
-                    'offset': 0,
-                    'data': []
-                }
 
-            # SDK 不支持 offset 入参，使用分页+本地切片实现
-            needed_count = max(0, offset) + max(0, limit)
-            page_size = min(100, max(1, needed_count))  # search 接口单页上限 100
+            logger.info(f"[S2 API] 调用搜索接口 - query='{query}', limit={limit}, offset={offset}")
             
-            logger.debug(f"[S2 DEBUG] 计算分页 - needed_count={needed_count}, page_size={page_size}")
-
-            logger.info(f"[S2 API] 调用搜索接口 - query='{query}', page_size={page_size}")
-            
-            # SDK 目前接受逗号分隔字符串，确保将列表参数规范化
+            # !!?(我不理解，SDK应该是接受列表)待验证:SDK 目前接受逗号分隔字符串，确保将列表参数规范化
             venue_param: Optional[Union[str, List[str]]]
             fos_param: Optional[Union[str, List[str]]]
+            venue_param = PaperFieldsConfig.param_str_to_list(venue)
+            fos_param = PaperFieldsConfig.param_str_to_list(fields_of_study)
+            """
             try:
                 venue_param = ','.join(venue) if isinstance(venue, list) else venue
             except Exception:
@@ -233,35 +205,23 @@ class S2SDKClient:
                 fos_param = ','.join(fields_of_study) if isinstance(fields_of_study, list) else fields_of_study
             except Exception:
                 fos_param = fields_of_study
-
+            """
             results = await self.client.search_paper(
                 query=query,
-                limit=page_size,
+                limit=limit,
                 fields=fields,
                 year=year,
                 venue=venue_param,
-                fields_of_study=fos_param
+                fields_of_study=fos_param,
+                match_title=match_title
             )
             logger.debug(f"[S2 DEBUG] API响应结果类型: {type(results)}")
             logger.debug(f"[S2 DEBUG] results是否为None: {results is None}")
             if results:
-                logger.debug(f"[S2 DEBUG] results.total: {getattr(results, 'total', 'N/A')}")
-                items: List[Dict[str, Any]] = []
-                item_count = 0
-                logger.debug(f"[S2 DEBUG] 开始遍历结果...")
-                for paper in (results.items if hasattr(results, 'items') else results):
-                    item_count += 1
-                    logger.debug(f"[S2 DEBUG] 处理第{item_count}篇论文: {paper.title if hasattr(paper, 'title') else 'N/A'}")
-                    items.append(paper.raw_data)
-                    if len(items) >= needed_count:
-                        logger.debug(f"[S2 DEBUG] 已获取足够结果，停止遍历")
-                        break
-                logger.info(f"[S2 API] 获取到{len(items)}篇论文")
-                sliced_items = items[offset:offset + limit] if offset else items[:limit]
                 result = {
                     'total': results.total,
                     'offset': offset,
-                    'data': sliced_items
+                    'data': results.items
                 }
                 logger.debug(f"[S2 DEBUG] 返回结果 - total={result['total']}, 实际返回={len(result['data'])}篇")
                 return result
@@ -306,14 +266,10 @@ class S2SDKClient:
                 fields = [
                     'paperId', 'title', 'year', 'authors', 'citationCount', 'venue'
                 ]
-            
-            # SDK 不支持 offset 入参，使用分页+本地切片实现
-            needed_count = max(0, offset) + max(0, limit)
-            page_size = min(1000, max(1, needed_count))  # citations 单页上限 1000
-
             citations = await self.client.get_paper_citations(
                 paper_id=paper_id,
-                limit=page_size,
+                limit=limit,
+                offset=offset,
                 fields=fields
             )
             if citations:
@@ -322,38 +278,9 @@ class S2SDKClient:
                     paper_obj = getattr(citation, 'paper', None)
                     if paper_obj is not None and hasattr(paper_obj, 'raw_data'):
                         items.append(paper_obj.raw_data)
-                    if len(items) >= needed_count:
-                        break
-                
-                # 确定真实的总数
-                if hasattr(citations, 'total'):
-                    total_count = citations.total
-                else:
-                    # 如果没有total字段，需要获取所有数据来确定真实总数
-                    if len(items) < needed_count:
-                        # 如果获取的数据少于需要的数量，说明已经是全部数据
-                        total_count = len(items)
-                    else:
-                        # 需要获取更多数据来确定真实总数
-                        all_citations = await self.client.get_paper_citations(
-                            paper_id=paper_id,
-                            limit=10000,  # 获取足够多的数据
-                            fields=fields
-                        )
-                        all_items: List[Dict[str, Any]] = []
-                        for citation in (all_citations.items if hasattr(all_citations, 'items') else all_citations):
-                            paper_obj = getattr(citation, 'paper', None)
-                            if paper_obj is not None and hasattr(paper_obj, 'raw_data'):
-                                all_items.append(paper_obj.raw_data)
-                        total_count = len(all_items)
-                        # 使用所有数据进行切片
-                        items = all_items
-                
-                sliced_items = items[offset:offset + limit] if offset else items[:limit]
                 return {
-                    'total': total_count,
                     'offset': offset,
-                    'data': sliced_items
+                    'data': items
                 }
             return {'total': 0, 'offset': offset, 'data': []}
             
@@ -395,56 +322,23 @@ class S2SDKClient:
                 fields = [
                     'paperId', 'title', 'year', 'authors', 'citationCount', 'venue'
                 ]
-            
-            # SDK 不支持 offset 入参，使用分页+本地切片实现
-            needed_count = max(0, offset) + max(0, limit)
-            page_size = min(1000, max(1, needed_count))  # references 单页上限 1000
-
             references = await self.client.get_paper_references(
                 paper_id=paper_id,
-                limit=page_size,
+                limit=limit,
+                offset=offset,
                 fields=fields
             )
             if references:
                 items: List[Dict[str, Any]] = []
-                for ref in (references.items if hasattr(references, 'items') else references):
-                    paper_obj = getattr(ref, 'paper', None)
+                for citation in (references.items if hasattr(references, 'items') else references):
+                    paper_obj = getattr(citation, 'paper', None)
                     if paper_obj is not None and hasattr(paper_obj, 'raw_data'):
                         items.append(paper_obj.raw_data)
-                    if len(items) >= needed_count:
-                        break
-                
-                # 确定真实的总数
-                if hasattr(references, 'total'):
-                    total_count = references.total
-                else:
-                    # 如果没有total字段，需要获取所有数据来确定真实总数
-                    if len(items) < needed_count:
-                        # 如果获取的数据少于需要的数量，说明已经是全部数据
-                        total_count = len(items)
-                    else:
-                        # 需要获取更多数据来确定真实总数
-                        all_references = await self.client.get_paper_references(
-                            paper_id=paper_id,
-                            limit=10000,  # 获取足够多的数据
-                            fields=fields
-                        )
-                        all_items: List[Dict[str, Any]] = []
-                        for ref in (all_references.items if hasattr(all_references, 'items') else all_references):
-                            paper_obj = getattr(ref, 'paper', None)
-                            if paper_obj is not None and hasattr(paper_obj, 'raw_data'):
-                                all_items.append(paper_obj.raw_data)
-                        total_count = len(all_items)
-                        # 使用所有数据进行切片
-                        items = all_items
-                
-                sliced_items = items[offset:offset + limit] if offset else items[:limit]
                 return {
-                    'total': total_count,
                     'offset': offset,
-                    'data': sliced_items
+                    'data': items
                 }
-            return {'total': 0, 'offset': offset, 'data': []}
+            return {'offset': offset, 'data': []}
             
         except S2ApiException:
             # 直接重新抛出S2ApiException，保持原始错误码
@@ -541,8 +435,6 @@ class S2SDKClient:
         except Exception as e:
             logger.error(f"SDK自动补全失败 query={query}: {e}")
             return None
-
-
 
 # 全局客户端实例
 s2_client = S2SDKClient()

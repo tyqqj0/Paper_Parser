@@ -1,5 +1,5 @@
 # Paper Parser项目管理
-.PHONY: help build up down start stop restart restart-api logs set-log-level clean clean-data clean-redis clean-neo4j status shell arq-logs
+.PHONY: help build up down start stop restart restart-api logs set-log-level clean clean-data clean-redis clean-neo4j status shell arq-logs backup-neo4j restore-neo4j backup-sqlite restore-sqlite
 
 # 默认目标
 help:
@@ -24,6 +24,10 @@ help:
 	@echo "  schema-migrate - 运行一次性Neo4j模式迁移（索引/约束）"
 	@echo "  schema-check   - 检查Neo4j索引/约束是否到位"
 	@echo "  pre-deploy     - 仅启动基础设施并执行Schema迁移"
+	@echo "  backup-neo4j   - 备份 Neo4j（冷备，生成 neo4j.dump 与带日期副本）"
+	@echo "  restore-neo4j  - 恢复 Neo4j（可选 DUMP_FILE，缺省交互选择备份）"
+	@echo "  backup-sqlite  - 备份 SQLite（冷备,fallback复制文件external_id_mapping.db）"
+	@echo "  restore-sqlite - 恢复 SQLite（可选 DB_FILE，缺省交互选择备份）"
 
 # 构建镜像
 build:
@@ -71,7 +75,7 @@ restart: down up
 # 仅重启API服务
 restart-api:
 	@echo "重启API服务..."
-	docker compose restart api
+	docker compose restart api arq-worker
 
 # 查看所有服务日志
 logs:
@@ -141,3 +145,94 @@ deploy: build up
 	@echo "Neo4j控制台: http://localhost:7474"
 	@echo "查看所有日志: make logs"
 	@echo "查看ARQ日志: make arq-logs"
+
+# 备份 Neo4j（冷备，短暂停机）
+backup-neo4j:
+	@echo "备份 Neo4j（冷备）..."
+	@mkdir -p /home/zhihui/code/parser2/backups/neo4j
+	@docker compose stop neo4j
+	@docker run --rm \
+		--volumes-from paper_parser_neo4j \
+		-v /home/zhihui/code/parser2/backups/neo4j:/backups \
+		neo4j:5 bash -lc "mkdir -p /backups && /var/lib/neo4j/bin/neo4j-admin database dump --to-path=/backups neo4j"
+	@DATE=$$(date +%F_%H%M%S); cp -f /home/zhihui/code/parser2/backups/neo4j/neo4j.dump /home/zhihui/code/parser2/backups/neo4j/neo4j-$$DATE.dump
+	@docker compose start neo4j
+	@echo "Neo4j 冷备完成。"
+
+# 恢复 Neo4j（从指定 dump 文件或交互选择）
+restore-neo4j:
+	@bash -lc 'set -euo pipefail; \
+	BACKUP_DIR="/home/zhihui/code/parser2/backups/neo4j"; \
+	SELECTED="$(DUMP_FILE)"; \
+	if [ -z "$$SELECTED" ]; then \
+		mapfile -t files < <(ls -1t "$$BACKUP_DIR"/*.dump 2>/dev/null || true); \
+		if [ $${#files[@]} -eq 0 ]; then echo "未在 $$BACKUP_DIR 找到 *.dump 备份文件"; exit 1; fi; \
+		echo "可用备份："; \
+		for i in $${!files[@]}; do idx=$$((i+1)); printf "  %d) %s\n" "$$idx" "$${files[$$i]}"; done; \
+		while :; do \
+			read -p "输入序号 [1-$${#files[@]}] (默认1): " choice; \
+			[ -z "$$choice" ] && choice=1; \
+			if [[ "$$choice" =~ ^[0-9]+$$ ]] && [ "$$choice" -ge 1 ] && [ "$$choice" -le $${#files[@]} ]; then \
+				SELECTED="$${files[$$((choice-1))]}"; break; \
+			else echo "无效输入，请重试。"; fi; \
+		done; \
+	else \
+		[ -f "$$SELECTED" ] || { echo "找不到文件 $$SELECTED"; exit 1; }; \
+	fi; \
+	echo "恢复 Neo4j 从 $$SELECTED..."; \
+	mkdir -p "$$BACKUP_DIR"; \
+	if [ "$$SELECTED" != "$$BACKUP_DIR/neo4j.dump" ]; then \
+		cp -f "$$SELECTED" "$$BACKUP_DIR/neo4j.dump"; \
+	else \
+		echo "选择的文件已是目标路径，跳过复制。"; \
+	fi; \
+	docker compose stop neo4j; \
+	docker run --rm --volumes-from paper_parser_neo4j -v "$$BACKUP_DIR":/backups \
+		neo4j:5 bash -lc "mkdir -p /backups && rm -rf /data/databases/neo4j && /var/lib/neo4j/bin/neo4j-admin database load --from-path=/backups --overwrite-destination=true neo4j"; \
+	docker compose start neo4j; \
+	echo "Neo4j 恢复完成。"'
+
+# 备份 SQLite（external_id_mapping.db）
+backup-sqlite:
+	@echo "备份 SQLite（external_id_mapping.db）..."
+	@mkdir -p /home/zhihui/code/parser2/backups/sqlite
+	@bash -lc 'set -euo pipefail; \
+	docker compose stop api arq-worker; \
+	BACKUP_DIR="/home/zhihui/code/parser2/backups/sqlite"; \
+	SRC_DB="/home/zhihui/code/parser2/Paper_Parser/data/external_id_mapping.db"; \
+	TS=$$(date +%F_%H%M%S); \
+	if command -v sqlite3 >/dev/null 2>&1; then \
+		sqlite3 "$$SRC_DB" ".backup '$$BACKUP_DIR/external_id_mapping-$$TS.db'"; \
+	else \
+		echo "未找到 sqlite3，直接复制数据库文件（请确保没有程序在写入该库）..."; \
+		cp -f "$$SRC_DB" "$$BACKUP_DIR/external_id_mapping-$$TS.db"; \
+	fi'
+	docker compose start api arq-worker;
+	@echo "SQLite 备份完成。"
+
+# 恢复 SQLite（提供 DB_FILE 或交互选择）
+restore-sqlite:
+	@bash -lc 'set -euo pipefail; \
+	docker compose stop api arq-worker; \
+	BACKUP_DIR="/home/zhihui/code/parser2/backups/sqlite"; \
+	TARGET_DB="/home/zhihui/code/parser2/Paper_Parser/data/external_id_mapping.db"; \
+	SELECTED="$(DB_FILE)"; \
+	if [ -z "$$SELECTED" ]; then \
+		mapfile -t files < <(ls -1t "$$BACKUP_DIR"/external_id_mapping-*.db 2>/dev/null || ls -1t "$$BACKUP_DIR"/*.db 2>/dev/null || true); \
+		if [ $${#files[@]} -eq 0 ]; then echo "未在 $$BACKUP_DIR 找到 *.db 备份文件"; exit 1; fi; \
+		echo "可用备份："; \
+		for i in $${!files[@]}; do idx=$$((i+1)); printf "  %d) %s\n" "$$idx" "$${files[$$i]}"; done; \
+		while :; do \
+			read -p "输入序号 [1-$${#files[@]}] (默认1): " choice; \
+			[ -z "$$choice" ] && choice=1; \
+			if [[ "$$choice" =~ ^[0-9]+$$ ]] && [ "$$choice" -ge 1 ] && [ "$$choice" -le $${#files[@]} ]; then \
+				SELECTED="$${files[$$((choice-1))]}"; break; \
+			else echo "无效输入，请重试。"; fi; \
+		done; \
+	else \
+		[ -f "$$SELECTED" ] || { echo "找不到文件 $$SELECTED"; exit 1; }; \
+	fi; \
+	echo "恢复 SQLite 从 $$SELECTED..."; \
+	cp -f "$$SELECTED" "$$TARGET_DB"; \
+	docker compose start api arq-worker; \
+	echo "SQLite 恢复完成。"'

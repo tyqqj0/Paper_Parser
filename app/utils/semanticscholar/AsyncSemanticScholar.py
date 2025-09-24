@@ -252,7 +252,8 @@ class AsyncSemanticScholar:
                 self,
                 paper_id: str,
                 fields: list = None,
-                limit: int = 100
+                limit: int = 100,
+                offset: int = 0
             ) -> PaginatedResults:
         '''
         Get details about a paper's authors
@@ -278,6 +279,8 @@ class AsyncSemanticScholar:
         if limit < 1 or limit > 1000:
             raise ValueError(
                 'The limit parameter must be between 1 and 1000 inclusive.')
+        if offset < 0:
+            raise ValueError('The offset parameter must be >= 0.')
 
         if not fields:
             fields = [item for item in Author.SEARCH_FIELDS
@@ -291,7 +294,8 @@ class AsyncSemanticScholar:
                 data_type=Author,
                 url=url,
                 fields=fields,
-                limit=limit
+                limit=limit,
+                offset=offset
             )
 
         return results
@@ -300,6 +304,7 @@ class AsyncSemanticScholar:
                 self,
                 paper_id: str,
                 fields: list = None,
+                offset: int = 0,
                 limit: int = 100
             ) -> PaginatedResults:
         '''
@@ -326,6 +331,8 @@ class AsyncSemanticScholar:
         if limit < 1 or limit > 1000:
             raise ValueError(
                 'The limit parameter must be between 1 and 1000 inclusive.')
+        if offset < 0:
+            raise ValueError('The offset parameter must be >= 0.')
 
         if not fields:
             fields = BaseReference.FIELDS + Paper.SEARCH_FIELDS
@@ -338,6 +345,7 @@ class AsyncSemanticScholar:
                 data_type=Citation,
                 url=url,
                 fields=fields,
+                offset=offset,
                 limit=limit
             )
 
@@ -347,7 +355,8 @@ class AsyncSemanticScholar:
                 self,
                 paper_id: str,
                 fields: list = None,
-                limit: int = 100
+                limit: int = 100,
+                offset: int = 0
             ) -> PaginatedResults:
         '''
         Get details about a paper's references
@@ -373,6 +382,8 @@ class AsyncSemanticScholar:
         if limit < 1 or limit > 1000:
             raise ValueError(
                 'The limit parameter must be between 1 and 1000 inclusive.')
+        if offset < 0:
+            raise ValueError('The offset parameter must be >= 0.')
 
         if not fields:
             fields = BaseReference.FIELDS + Paper.SEARCH_FIELDS
@@ -385,7 +396,8 @@ class AsyncSemanticScholar:
                 data_type=Reference,
                 url=url,
                 fields=fields,
-                limit=limit
+                limit=limit,
+                offset=offset
             )
 
         return results
@@ -404,7 +416,8 @@ class AsyncSemanticScholar:
                 limit: int = 100,
                 bulk: bool = False,
                 sort: str = None,
-                match_title: bool = False
+                match_title: bool = False,
+                offset: int = 0
             ) -> Union[PaginatedResults, Paper]:
         '''
         Search for papers by keyword. Performs a search query based on the 
@@ -457,6 +470,8 @@ class AsyncSemanticScholar:
         if limit < 1 or limit > 100:
             raise ValueError(
                 'The limit parameter must be between 1 and 100 inclusive.')
+        if offset < 0:
+            raise ValueError('The offset parameter must be >= 0.')
 
         if not fields:
             fields = Paper.SEARCH_FIELDS
@@ -518,7 +533,8 @@ class AsyncSemanticScholar:
                 fields,
                 limit,
                 self.auth_header,
-                max_results=max_results
+                max_results=max_results,
+                offset=offset
             )
 
         return results if not match_title else results[0]
@@ -608,7 +624,8 @@ class AsyncSemanticScholar:
                 self,
                 author_id: str,
                 fields: list = None,
-                limit: int = 100
+                limit: int = 100,
+                offset: int = 0
             ) -> PaginatedResults:
         '''
         Get details about a author's papers
@@ -634,6 +651,8 @@ class AsyncSemanticScholar:
         if limit < 1 or limit > 1000:
             raise ValueError(
                 'The limit parameter must be between 1 and 1000 inclusive.')
+        if offset < 0:
+            raise ValueError('The offset parameter must be >= 0.')
 
         if not fields:
             fields = Paper.SEARCH_FIELDS
@@ -646,7 +665,8 @@ class AsyncSemanticScholar:
                 data_type=Paper,
                 url=url,
                 fields=fields,
-                limit=limit
+                limit=limit,
+                offset=offset
             )
 
         return results
@@ -655,7 +675,8 @@ class AsyncSemanticScholar:
                 self,
                 query: str,
                 fields: list = None,
-                limit: int = 100
+                limit: int = 100,
+                offset: int = 0
             ) -> PaginatedResults:
         '''
         Search for authors by name
@@ -675,6 +696,8 @@ class AsyncSemanticScholar:
         if limit < 1 or limit > 1000:
             raise ValueError(
                 'The limit parameter must be between 1 and 1000 inclusive.')
+        if offset < 0:
+            raise ValueError('The offset parameter must be >= 0.')
 
         if not fields:
             fields = Author.SEARCH_FIELDS
@@ -690,7 +713,8 @@ class AsyncSemanticScholar:
                 fields,
                 limit,
                 self.auth_header,
-                max_results=1000
+                max_results=1000,
+                offset=offset
             )
 
         return results

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Optional, Any, Dict
 from urllib.parse import urlparse
+from datetime import datetime, date
 
 from loguru import logger
 
@@ -62,6 +63,41 @@ class TaskQueue:
             self._arq_pool = None
             self._connected = False
 
+    def _json_safe(self, value: Any) -> Any:
+        """将对象转换为可被 msgpack/JSON 序列化的形式。
+
+        处理：
+        - Neo4j/pendulum/内置 datetime/date -> ISO8601 字符串
+        - 集合/元组 -> 列表
+        - 映射/列表 -> 递归处理
+        - 其他不可序列化对象 -> str(value)
+        """
+        try:
+            if hasattr(value, 'to_native') and callable(getattr(value, 'to_native')):
+                try:
+                    native = value.to_native()
+                    if isinstance(native, (datetime, date)):
+                        return native.isoformat()
+                    return self._json_safe(native)
+                except Exception:
+                    return str(value)
+            if hasattr(value, 'to_iso8601_string') and callable(getattr(value, 'to_iso8601_string')):
+                try:
+                    return value.to_iso8601_string()
+                except Exception:
+                    return str(value)
+            if isinstance(value, (datetime, date)):
+                return value.isoformat()
+            if isinstance(value, dict):
+                return {self._json_safe(k): self._json_safe(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple, set)):
+                return [self._json_safe(item) for item in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+        except Exception:
+            return str(value)
+
     async def enqueue_fetch_from_s2(self, paper_id: str, fields: Optional[str]) -> None:
         """入队抓取 S2 并写缓存/入库。"""
         if not self._connected or self._arq_pool is None:
@@ -80,25 +116,12 @@ class TaskQueue:
             raise RuntimeError("ARQ任务队列未连接")
             
         try:
-            await self._arq_pool.enqueue_job('neo4j_merge', full_data)
+            await self._arq_pool.enqueue_job('neo4j_merge', self._json_safe(full_data))
             paper_id = full_data.get('paperId', 'unknown')
             logger.debug(f"ARQ任务入队成功: neo4j_merge({paper_id})")
         except Exception as e:
             logger.error(f"ARQ入队 neo4j_merge 失败: {e}")
             raise
-
-    async def enqueue_set_paper_cache(self, paper_id: str, data: Dict[str, Any], fields: Optional[str] = None) -> None:
-        """入队设置论文缓存。"""
-        if not self._connected or self._arq_pool is None:
-            raise RuntimeError("ARQ任务队列未连接")
-            
-        try:
-            await self._arq_pool.enqueue_job('set_paper_cache', paper_id, data, fields)
-            logger.debug(f"ARQ任务入队成功: set_paper_cache({paper_id})")
-        except Exception as e:
-            logger.error(f"ARQ入队 set_paper_cache 失败: {e}")
-            raise
-
 
 # 全局任务队列实例
 task_queue = TaskQueue()
