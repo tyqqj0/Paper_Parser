@@ -184,15 +184,19 @@ class PaginatedResults:
 
         result_items = []
 
-        if 'data' in results:
+        if isinstance(results, dict) and 'data' in results:
 
-            self._data = results['data']
-            self._total = results['total'] if 'total' in results else 0
-            self._offset = results['offset'] if 'offset' in results else 0
-            self._next = results['next'] if 'next' in results else 0
-            self._continuation_token = results['token'] if 'token' in results else None
+            data_list = results.get('data') or []
+            if not isinstance(data_list, list):
+                data_list = []
 
-            for item in results['data']:
+            self._data = data_list
+            self._total = results.get('total', 0)
+            self._offset = results.get('offset', 0)
+            self._next = results.get('next', 0)
+            self._continuation_token = results.get('token')
+
+            for item in data_list:
                 result_items.append(self._data_type(item))
 
             self._items += result_items

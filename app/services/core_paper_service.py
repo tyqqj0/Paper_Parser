@@ -66,7 +66,7 @@ class CorePaperService:
                 return self._format_response(cached_data, fields)
             
             if not PaperFieldsConfig.is_in_noraml_fields(fields):
-                logger.debug(f"非普通字段,直接从S2获取: {paper_id}")
+                logger.debug(f"非常规字段,直接从S2获取: {paper_id}")
                 return await self._fetch_from_s2(paper_id, fields)
 
             # 2. Neo4j持久化查询（支持 alias 识别）
@@ -363,7 +363,8 @@ class CorePaperService:
         cached_data = await self.redis.get(cache_key)
         if cached_data:
             logger.info(f"搜索缓存命中: {query}")
-            # 条件刷新：当缓存存在时，选取前 N 个 paperId 进行后台刷新
+            return cached_data
+            # (可选)条件刷新：当缓存存在时，选取前 N 个 paperId 进行后台刷新
             try:
                 if getattr(settings, 'enable_search_background_ingest', True):
                     top_n = max(0, int(getattr(settings, 'search_background_ingest_top_n', 3) or 0))
@@ -552,6 +553,7 @@ class CorePaperService:
                 ##neo4j查询
                 neo4j_data = await self._get_from_neo4j(ids)
                 if neo4j_data:
+                    logger.debug(f"neo4j查询: {neo4j_data}")
                     results[i] = self._format_response(neo4j_data, fields)
                     logger.debug(f"批量缓存命中neo4j: {ids}")
                 else:

@@ -45,7 +45,20 @@ class Neo4jClient:
             await self.driver.close()
             logger.info("Neo4j连接已关闭")
     
-    
+    def _format_paper(self, node_props: Dict) -> Dict:
+        """格式化论文"""
+        data_json = node_props.get("dataJson")
+        if isinstance(data_json, str) and data_json:
+            try:
+                payload = json.loads(data_json)
+                if node_props.get("lastUpdated") is not None:
+                    payload["lastUpdated"] = node_props.get("lastUpdated")
+                if node_props.get("embedding_specter_v2") is not None:
+                    payload["embedding"]={"model":"specter_v2","vector":node_props.get("embedding_specter_v2")}
+                return payload
+            except Exception:
+                return node_props
+        return node_props
     async def get_paper(self, paper_id: str) -> Optional[Dict]:
         """根据paperId获取论文"""
         if self.driver is None:
@@ -62,17 +75,7 @@ class Neo4jClient:
                 if record:
                     paper_node = record["p"]
                     node_props = dict(paper_node)
-                    data_json = node_props.get("dataJson")
-                    if isinstance(data_json, str) and data_json:
-                        try:
-                            # 优先返回完整dataJson（包含authors等），并保留lastUpdated等少量节点字段
-                            payload = json.loads(data_json)
-                            if node_props.get("lastUpdated") is not None:
-                                payload["lastUpdated"] = node_props.get("lastUpdated")
-                            return payload
-                        except Exception:
-                            return node_props
-                    return node_props
+                    return self._format_paper(node_props)
                 return None
             except Exception as e:
                 logger.error(f"Neo4j获取论文失败 paper_id={paper_id}: {e}")
@@ -664,7 +667,7 @@ class Neo4jClient:
                 )
                 papers = []
                 async for record in result:
-                    papers.append(dict(record["node"]))
+                    papers.append(self._format_paper(dict(record["node"])))
                 return papers
             except Exception as e:
                 logger.error(f"搜索论文失败 query={query}: {e}")

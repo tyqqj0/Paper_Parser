@@ -32,16 +32,6 @@ SCHEMA_STATEMENTS: List[str] = [
     "CREATE INDEX paper_year IF NOT EXISTS FOR (p:Paper) ON (p.year)",
     "CREATE INDEX paper_ingest_status IF NOT EXISTS FOR (p:Paper) ON (p.ingestStatus)",
 
-    # 外部ID属性索引
-    "CREATE INDEX paper_doi IF NOT EXISTS FOR (p:Paper) ON (p.doi)",
-    "CREATE INDEX paper_arxiv IF NOT EXISTS FOR (p:Paper) ON (p.arxiv)",
-    "CREATE INDEX paper_dblp IF NOT EXISTS FOR (p:Paper) ON (p.dblp)",
-    "CREATE INDEX paper_mag IF NOT EXISTS FOR (p:Paper) ON (p.mag)",
-    "CREATE INDEX paper_pmid IF NOT EXISTS FOR (p:Paper) ON (p.pmid)",
-    "CREATE INDEX paper_pmcid IF NOT EXISTS FOR (p:Paper) ON (p.pmcid)",
-    "CREATE INDEX paper_acl IF NOT EXISTS FOR (p:Paper) ON (p.acl)",
-    "CREATE INDEX paper_url IF NOT EXISTS FOR (p:Paper) ON (p.url)",
-    "CREATE INDEX paper_corpus_id IF NOT EXISTS FOR (p:Paper) ON (p.corpusId)",
 
     # DataChunk 索引与唯一约束
     "CREATE INDEX datachunk_paper_id IF NOT EXISTS FOR (d:DataChunk) ON (d.paperId)",

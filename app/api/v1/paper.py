@@ -171,7 +171,6 @@ async def match_paper_title(
 
         if not papers:
             raise HTTPException(status_code=404, detail="Title match not found")
-
         return {
             'total': 1,
             'offset': 0,

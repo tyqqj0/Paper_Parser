@@ -206,7 +206,7 @@ class S2SDKClient:
             except Exception:
                 fos_param = fields_of_study
             """
-            results = await self.client.search_paper(
+            results = dict(await self.client.search_paper(
                 query=query,
                 limit=limit,
                 fields=fields,
@@ -214,9 +214,22 @@ class S2SDKClient:
                 venue=venue_param,
                 fields_of_study=fos_param,
                 match_title=match_title
-            )
-            logger.debug(f"[S2 DEBUG] API响应结果类型: {type(results)}")
+            ))
+            logger.debug(f"[S2 DEBUG] API响应结果类型: {results}")
             logger.debug(f"[S2 DEBUG] results是否为None: {results is None}")
+            if match_title:
+                if results:
+                    return {
+                        'total': 1,
+                        'offset': 0,
+                        'data': [results]
+                    }
+                else:
+                    return {
+                        'total': 0,
+                        'offset': 0,
+                        'data': []
+                    }
             if results:
                 result = {
                     'total': results.total,
