@@ -555,8 +555,19 @@ class CorePaperService:
                     results[i] = None  # 占位
                     uncached_ids2.append((i, ids))
         else:
-            uncached_ids2 = list(enumerate(paper_ids))
-            results = [None] * len(paper_ids)  # 初始化结果列表
+            if not disable_cache:
+                cache_keys = [CacheKeys.PAPER_FULL.format(paper_id=pid) for pid in paper_ids]
+                cached_data = await self.redis.mget(cache_keys)
+                for i, (paper_id, cached) in enumerate(zip(paper_ids, cached_data)):
+                    if cached:
+                        results.append(self._format_response(cached, fields))
+                        logger.debug(f"批量缓存命中字段redis: {paper_id}")
+                    else:
+                        results.append(None)  # 占位符
+                        uncached_ids.append((i, paper_id))
+            else:
+                uncached_ids2 = list(enumerate(paper_ids))
+                results = [None] * len(paper_ids)  # 初始化结果列表
         # 2. 批量获取未缓存的数据
         if uncached_ids2:
             try:

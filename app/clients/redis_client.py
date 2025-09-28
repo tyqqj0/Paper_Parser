@@ -200,7 +200,7 @@ class RedisClient:
     async def mset_paper(self, paper_mapping: Dict[str, Dict], fields: Optional[str] = None, ttl: Optional[int] = None) -> bool:
         """批量设置论文缓存"""
         if fields:
-            logger.debug(f"批量设置论文缓存1: {fields}")
+            logger.debug(f"批量设置字段论文缓存: {fields}")
             cache_mapping = {
                 f"paper:{paper_id}:{fields}": paper_data
                 for paper_id, paper_data in paper_mapping.items()

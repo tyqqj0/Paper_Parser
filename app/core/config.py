@@ -99,7 +99,8 @@ class CacheKeys:
     PAPER_BASIC = "paper:{paper_id}:basic"
     PAPER_CITATIONS = "paper:{paper_id}:citations"
     PAPER_REFERENCES = "paper:{paper_id}:references"
-    
+    PAPER_FIELDS = "paper:{paper_id}:{fields}"
+
     # 搜索相关
     SEARCH_QUERY = "search:{query_hash}"
     SEARCH_AUTOCOMPLETE = "autocomplete:{query}"
