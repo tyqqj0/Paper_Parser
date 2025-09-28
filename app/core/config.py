@@ -1,9 +1,12 @@
 """
 应用配置管理
 """
+from ast import List
 from typing import Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+from app.models.paper import PaperFieldsConfig
 
 
 class Settings(BaseSettings):
@@ -112,6 +115,17 @@ class CacheKeys:
     # 系统状态
     SYSTEM_S2_STATUS = "system:s2_api_status"
     SYSTEM_METRICS = "system:metrics"
+
+    @classmethod
+    def format_paper_cached_key(cls, paper_id: str, fields = None, normalize=False) -> str:
+        """格式化缓存键"""
+        if not fields:
+            return cls.PAPER_FULL.format(paper_id=paper_id)
+        if normalize:
+            fields = PaperFieldsConfig.normalize_fields(fields)
+        fields = PaperFieldsConfig.param_list_to_str(fields)
+        return cls.PAPER_FIELDS.format(paper_id=paper_id, fields=fields)
+
 
 
 # 错误码定义

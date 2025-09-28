@@ -46,8 +46,6 @@ class CorePaperService:
             disable_cache: 是否禁用缓存，为True时直接从S2 API获取
         """
         try:
-            if not PaperFieldsConfig.is_in_noraml_fields(fields):
-                disable_cache = True
             if disable_cache:
                 logger.debug(f"禁用缓存，直接从S2获取: {paper_id}")
                 return await self._fetch_from_s2(paper_id, fields)
@@ -61,13 +59,16 @@ class CorePaperService:
             # 如果禁用缓存，直接调用S2 API
             logger.info(f"get_paper查询: {paper_id}")
             # 1. Redis缓存查询（统一使用 full 视图键）
-            full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
-            cached_data = await self.redis.get(full_cache_key)
+            cached_data = await self.redis.get_paper(paper_id, fields)
             
             if cached_data:
                 logger.debug(f"Redis缓存命中: {paper_id}")
                 return self._format_response(cached_data, fields)
             
+            if not PaperFieldsConfig.is_in_noraml_fields(fields):
+                logger.debug(f"非普通字段,直接从S2获取: {paper_id}")
+                return await self._fetch_from_s2(paper_id, fields)
+
             # 2. Neo4j持久化查询（支持 alias 识别）
             neo4j_data = await self._get_from_neo4j(paper_id)
             if neo4j_data:
@@ -137,7 +138,7 @@ class CorePaperService:
         
         # 优先从 full 视图裁剪，避免重复上游调用
         try:
-            full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
+            full_cache_key = CacheKeys.format_paper_cached_key(paper_id, fields)
             full_cached = await self.redis.get(full_cache_key)
             if isinstance(full_cached, dict) and isinstance(full_cached.get('citations'), list):
                 citations_list = full_cached['citations']
@@ -231,7 +232,7 @@ class CorePaperService:
         logger.info(f"尝试参考文献缓存获取: {cache_key}")
         # 优先从 full 视图裁剪
         try:
-            full_cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
+            full_cache_key = CacheKeys.format_paper_cached_key(paper_id, fields)
             full_cached = await self.redis.get(full_cache_key)
             if isinstance(full_cached, dict) and isinstance(full_cached.get('references'), list):
                 references_list = full_cached['references']
@@ -444,12 +445,14 @@ class CorePaperService:
                 await self.redis.set(cache_key, shaped, settings.cache_search_ttl)
                 return shaped
             """
-            if prefer_local:
+            if prefer_local and PaperFieldsConfig.is_in_noraml_fields(fields):
+                logger.debug(f"尝试本地搜索: {query}")
                 try:
                     local_hits = await self.neo4j.search_papers(query=query, limit=limit, offset=offset)
                 except Exception:
                     local_hits = []
                 if local_hits:
+                    logger.debug(f"本地搜索命中: {query}")
                     try:
                         projected_local = [self._format_response(hit, fields) if fields else hit for hit in local_hits]
                     except Exception:
@@ -535,7 +538,7 @@ class CorePaperService:
         uncached_ids2=[]
         if PaperFieldsConfig.is_in_noraml_fields(fields) and not disable_cache:
         # 1. 批量检查缓存
-            cache_keys = [CacheKeys.PAPER_FULL.format(paper_id=pid) for pid in paper_ids]
+            cache_keys = [CacheKeys.format_paper_cached_key(pid, None) for pid in paper_ids]
             cached_data = await self.redis.mget(cache_keys)
             
             for i, (paper_id, cached) in enumerate(zip(paper_ids, cached_data)):
@@ -556,7 +559,8 @@ class CorePaperService:
                     uncached_ids2.append((i, ids))
         else:
             if not disable_cache:
-                cache_keys = [CacheKeys.PAPER_FULL.format(paper_id=pid) for pid in paper_ids]
+                cache_keys = [CacheKeys.format_paper_cached_key(pid, fields, normalize=True) for pid in paper_ids]
+                logger.debug(f"尝试批量缓存字段redis: {cache_keys}")
                 cached_data = await self.redis.mget(cache_keys)
                 for i, (paper_id, cached) in enumerate(zip(paper_ids, cached_data)):
                     if cached:
@@ -564,7 +568,7 @@ class CorePaperService:
                         logger.debug(f"批量缓存命中字段redis: {paper_id}")
                     else:
                         results.append(None)  # 占位符
-                        uncached_ids.append((i, paper_id))
+                        uncached_ids2.append((i, paper_id))
             else:
                 uncached_ids2 = list(enumerate(paper_ids))
                 results = [None] * len(paper_ids)  # 初始化结果列表
@@ -572,8 +576,9 @@ class CorePaperService:
         if uncached_ids2:
             try:
                 # 处理fields参数 - 转换为列表格式
+                logger.debug(f"处理fields参数 - 转换为列表格式: {fields}")
                 fields_list = PaperFieldsConfig.normalize_fields(fields)
-                
+                logger.debug(f"处理fields参数 - 转换为列表格式2: {fields_list}")
                 batch_ids = [pid for _, pid in uncached_ids2]
                 batch_data = await self.s2.get_papers_batch(batch_ids, fields_list)
                 
@@ -615,8 +620,8 @@ class CorePaperService:
             
             # 这里简化处理，实际可能需要scan操作
             keys_to_delete = [
-                self._get_cache_key(paper_id, None),
-                self._get_cache_key(paper_id, "basic"),
+                CacheKeys.format_paper_cached_key(paper_id, None),
+                CacheKeys.format_paper_cached_key(paper_id, "basic"),
                 f"paper:{paper_id}:citations:*",
                 f"paper:{paper_id}:references:*"
             ]
@@ -649,12 +654,6 @@ class CorePaperService:
         except Exception as e:
             logger.error(f"缓存预热失败 paper_id={paper_id}: {e}")
             return False
-
-    def _get_cache_key(self, paper_id: str, fields: Optional[str] = None) -> str:
-        """生成缓存键"""
-        if fields:
-            return f"paper:{paper_id}:{fields}"
-        return CacheKeys.PAPER_FULL.format(paper_id=paper_id)
     
     async def _get_from_neo4j(self, paper_id: str) -> Optional[Dict]:
         """从Neo4j获取数据"""
@@ -734,20 +733,19 @@ class CorePaperService:
             return data
     async def _cache_normal_paper(self, paper_id: str, paper_data: Dict,fields: Optional[str] = None,skip_neo4j_enqueue: bool = False) -> bool:
         """缓存正常论文"""
-        if fields:
-            await self.redis.set_paper(paper_id, paper_data, fields)
-        if not PaperFieldsConfig.is_in_noraml_fields(fields):
-            return
         await self.redis.set_paper(paper_id, paper_data)
+        if not PaperFieldsConfig.is_in_noraml_fields(fields):
+            await self.redis.set_paper(paper_id, paper_data, fields)
         # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
         # 检查是否在ARQ worker环境中
         if not skip_neo4j_enqueue:
             await task_queue.enqueue_neo4j_merge(paper_data)
         else:
             await self.neo4j.merge_paper_full(paper_data)
-    async def _cache_normal_papers(self, paper_mapping: Dict[str, Dict],fields: Optional[str] = None,skip_neo4j_enqueue: bool = False) -> bool:
+    async def _cache_normal_papers(self, paper_mapping: Dict[str, Dict],fields = None,skip_neo4j_enqueue: bool = False) -> bool:
         """缓存正常论文"""
         if fields:
+            logger.debug(f"批量写入缓存: {fields}")
             await self.redis.mset_paper(paper_mapping, fields, settings.cache_paper_ttl)
         if not PaperFieldsConfig.is_in_noraml_fields(fields):
             return

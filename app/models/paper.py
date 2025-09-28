@@ -92,12 +92,12 @@ class PaperFieldsConfig:
         return param
     @classmethod
     def get_normal_fields(cls) -> List[str]:
-        return cls.get_fields_for_level('extended')+cls.EMBEDDING_FIELDS
+        return sorted(cls.get_fields_for_level('extended')+cls.EMBEDDING_FIELDS)
     @classmethod
     def normalize_fields(cls,fields=None) -> List[str]:
         if fields:
             fields = cls.param_str_to_list(fields)
-            return list(set(cls.param_str_to_list(fields)+cls.get_normal_fields()))
+            return sorted(list(set(cls.param_str_to_list(fields)+cls.get_normal_fields())))
         else:   
             return cls.get_normal_fields()
     @classmethod

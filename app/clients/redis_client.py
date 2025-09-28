@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import redis.asyncio as redis
 from loguru import logger
 
+from app.models.paper import PaperFieldsConfig
 from app.core.config import settings, CacheKeys
 
 
@@ -191,24 +192,28 @@ class RedisClient:
             return False
     
     # 论文缓存相关方法
-    async def get_paper(self, paper_id: str, fields: Optional[str] = None) -> Optional[Dict]:
+    async def get_paper(self, paper_id: str, fields = None) -> Optional[Dict]:
         """获取论文缓存"""
-        cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
-        if fields:
-            cache_key = f"paper:{paper_id}:{fields}"
-        return await self.get(cache_key)
-    async def mset_paper(self, paper_mapping: Dict[str, Dict], fields: Optional[str] = None, ttl: Optional[int] = None) -> bool:
+        if not fields:
+            return await self.get(CacheKeys.format_paper_cached_key(paper_id, None))
+        cache_key = CacheKeys.format_paper_cached_key(paper_id, fields, normalize=True)
+        logger.debug(f"尝试获取论文缓存: {cache_key}")
+        data = await self.get(cache_key)
+        if not data and PaperFieldsConfig.is_in_noraml_fields(fields):
+            data = await self.get(CacheKeys.format_paper_cached_key(paper_id, None))
+        return data
+    async def mset_paper(self, paper_mapping: Dict[str, Dict], fields = None, ttl: Optional[int] = None) -> bool:
         """批量设置论文缓存"""
         if fields:
             logger.debug(f"批量设置字段论文缓存: {fields}")
             cache_mapping = {
-                f"paper:{paper_id}:{fields}": paper_data
+                CacheKeys.format_paper_cached_key(paper_id, fields, normalize=True): paper_data
                 for paper_id, paper_data in paper_mapping.items()
             }
         else:
             logger.debug(f"批量设置论文缓存: full")
             cache_mapping = {
-                CacheKeys.PAPER_FULL.format(paper_id=paper_id): paper_data
+                CacheKeys.format_paper_cached_key(paper_id, None): paper_data
                 for paper_id, paper_data in paper_mapping.items()
             }
         return await self.mset(cache_mapping, ttl)
@@ -220,10 +225,7 @@ class RedisClient:
         ttl: Optional[int] = None
     ) -> bool:
         """设置论文缓存"""
-        cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
-        if fields:
-            cache_key = f"paper:{paper_id}:{fields}"
-        
+        cache_key = CacheKeys.format_paper_cached_key(paper_id, fields)
         # 添加缓存时间戳
         paper_data["cached_at"] = datetime.now().isoformat()
         
