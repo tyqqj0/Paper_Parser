@@ -372,12 +372,7 @@ class S2SDKClient:
     ) -> List[Optional[Dict[str, Any]]]:
         """批量获取论文"""
         try:
-            if not fields:
-                fields = [
-                    'paperId', 'title', 'abstract', 'year', 'authors',
-                    'citationCount', 'venue', 'fieldsOfStudy'
-                ]
-            
+            fields=PaperFieldsConfig.normalize_fields(fields)
             papers = await self.client.get_papers(
                 paper_ids=paper_ids,
                 fields=fields

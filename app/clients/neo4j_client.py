@@ -8,6 +8,7 @@ from datetime import datetime
 from neo4j import AsyncGraphDatabase, AsyncDriver, AsyncSession
 from loguru import logger
 
+from app.services import external_id_mapping
 from app.core.config import settings
 from app.models.paper import EnhancedPaper
 from app.services.external_id_mapping import ExternalIds, normalize_title_norm
@@ -122,6 +123,9 @@ class Neo4jClient:
     async def merge_paper_full(self, paper_data: Dict) -> bool:
         """从 full_data 合并论文数据"""
         if self.driver is None:
+            return False
+        ok = await external_id_mapping.external_id_mapping.batch_set_mappings(ExternalIds.from_dict(paper_data.get('externalIds', {})), paper_data.get('paperId'))
+        if not ok:
             return False
         ok = await self.merge_paper(paper_data)
         if not ok:

@@ -53,7 +53,7 @@ class CorePaperService:
                 return await self._fetch_from_s2(paper_id, fields)
             # 0. 处理外部ID映射
             resolved_paper_id = await self.external_mapping.resolve_paper_id(paper_id)
-            if resolved_paper_id != paper_id:
+            if resolved_paper_id and resolved_paper_id != paper_id:
                 logger.debug(f"外部ID映射解析: {paper_id} -> {resolved_paper_id}")
                 paper_id = resolved_paper_id
             else:
@@ -74,7 +74,7 @@ class CorePaperService:
                 logger.debug(f"Neo4j数据命中: {paper_id}")
                 
                 # 异步更新Redis缓存
-                await redis_client.set_paper(paper_id, neo4j_data, None)
+                await self.redis.set_paper(paper_id, neo4j_data, None)
                 
                 return self._format_response(neo4j_data, fields)
             """
@@ -378,10 +378,10 @@ class CorePaperService:
         
         try:
             # 处理fields参数 - 转换为列表格式
-            fields_list = self.s2.param_str_to_list(fields)
+            fields_list = PaperFieldsConfig.param_str_to_list(fields)
             # 处理venue和fields_of_study参数 - 转换为列表格式
-            venue_list = self.s2.param_str_to_list(venue)
-            fields_of_study_list = self.s2.param_str_to_list(fields_of_study)
+            venue_list = PaperFieldsConfig.param_str_to_list(venue)
+            fields_of_study_list = PaperFieldsConfig.param_str_to_list(fields_of_study)
             """
             # 标题精准匹配模式（最多返回1条）
             if match_title:
@@ -526,48 +526,67 @@ class CorePaperService:
     async def get_papers_batch(
         self, 
         paper_ids: List[str], 
-        fields: Optional[str] = None
+        fields: Optional[str] = None,
+        disable_cache: bool = False
     ) -> List[Dict[str, Any]]:
         """批量获取论文 - 缓存策略"""
         results = []
         uncached_ids = []
-        
+        uncached_ids2=[]
+        if PaperFieldsConfig.is_in_noraml_fields(fields) and not disable_cache:
         # 1. 批量检查缓存
-        cache_keys = [CacheKeys.PAPER_FULL.format(paper_id=pid) for pid in paper_ids]
-        cached_data = await self.redis.mget(cache_keys)
-        
-        for i, (paper_id, cached) in enumerate(zip(paper_ids, cached_data)):
-            if cached:
-                results.append(self._format_response(cached, fields))
-                logger.debug(f"批量缓存命中: {paper_id}")
-            else:
-                results.append(None)  # 占位符
-                uncached_ids.append((i, paper_id))
-        
+            cache_keys = [CacheKeys.PAPER_FULL.format(paper_id=pid) for pid in paper_ids]
+            cached_data = await self.redis.mget(cache_keys)
+            
+            for i, (paper_id, cached) in enumerate(zip(paper_ids, cached_data)):
+                if cached:
+                    results.append(self._format_response(cached, fields))
+                    logger.debug(f"批量缓存命中redis: {paper_id}")
+                else:
+                    results.append(None)  # 占位符
+                    uncached_ids.append((i, paper_id))
+            for i,ids in uncached_ids:
+                ##neo4j查询
+                neo4j_data = await self._get_from_neo4j(ids)
+                if neo4j_data:
+                    results[i] = self._format_response(neo4j_data, fields)
+                    logger.debug(f"批量缓存命中neo4j: {ids}")
+                else:
+                    results[i] = None  # 占位
+                    uncached_ids2.append((i, ids))
+        else:
+            uncached_ids2 = list(enumerate(paper_ids))
+            results = [None] * len(paper_ids)  # 初始化结果列表
         # 2. 批量获取未缓存的数据
-        if uncached_ids:
+        if uncached_ids2:
             try:
                 # 处理fields参数 - 转换为列表格式
-                fields_list = self.s2.param_str_to_list(fields)
+                fields_list = PaperFieldsConfig.normalize_fields(fields)
                 
-                batch_ids = [pid for _, pid in uncached_ids]
+                batch_ids = [pid for _, pid in uncached_ids2]
                 batch_data = await self.s2.get_papers_batch(batch_ids, fields_list)
                 
                 # 更新结果和缓存
                 cache_mapping = {}
                 for j, paper_data in enumerate(batch_data):
+                    if j >= len(uncached_ids2):
+                        logger.warning(f"batch_data index {j} exceeds uncached_ids2 length {len(uncached_ids2)}")
+                        break
+                    
+                    idx, paper_id = uncached_ids2[j]
                     if paper_data:  # S2可能返回null
-                        idx, paper_id = uncached_ids[j]
                         projected = self._format_response(paper_data, fields)
-                        results[idx] = projected
-                        
-                        # 准备批量缓存
-                        cache_key = CacheKeys.PAPER_FULL.format(paper_id=paper_id)
-                        cache_mapping[cache_key] = paper_data
+                        if idx < len(results):
+                            results[idx] = projected
+                            # 准备批量缓存
+                            cache_mapping[paper_id] = paper_data
+                        else:
+                            logger.error(f"Index {idx} out of range for results list of length {len(results)}")
+                    # 如果 paper_data 为 None，保持 results[idx] 为 None（已在初始化时设置）
                 
                 # 批量写入缓存
                 if cache_mapping:
-                    await self.redis.mset(cache_mapping, settings.cache_paper_ttl)
+                    await self._cache_normal_papers(cache_mapping, fields_list, False)
                     
             except S2ApiException as e:
                 raise HTTPException(status_code=500, detail=f"批量获取失败: {e.message}")
@@ -605,16 +624,13 @@ class CorePaperService:
         """预热指定论文的缓存"""
         try:
             # 处理fields参数 - 转换为列表格式
-            fields_list = self.s2.param_str_to_list(fields)
+            fields_list = PaperFieldsConfig.normalize_fields(fields)
             
             # 强制从S2获取最新数据
             paper_data = await self.s2.get_paper(paper_id, fields_list)
-            
-            # 写入缓存
-            await self.redis.set_paper(paper_id, paper_data, None)
-            
-            # 异步写入Neo4j（优先入队）
-            await task_queue.enqueue_neo4j_merge(paper_data)
+            if not paper_data:
+                return False
+            await self._cache_normal_paper(paper_id, paper_data, fields_list, False)
             
             logger.info(f"缓存预热成功: {paper_id}")
             return True
@@ -661,7 +677,6 @@ class CorePaperService:
             for token in part.split('.'):
                 node = node.setdefault(token, {})
         return field_tree
-
     def _project_by_field_tree(self, value: Any, tree: Dict[str, Dict]) -> Any:
         """根据字段树对给定值进行投影（裁剪）。空树表示直接返回原值。"""
         if not isinstance(tree, dict) or len(tree) == 0:
@@ -706,7 +721,31 @@ class CorePaperService:
         except Exception as _:
             # 任意裁剪异常时回退到原始数据，避免影响主流程
             return data
-    
+    async def _cache_normal_paper(self, paper_id: str, paper_data: Dict,fields: Optional[str] = None,skip_neo4j_enqueue: bool = False) -> bool:
+        """缓存正常论文"""
+        if fields:
+            await self.redis.set_paper(paper_id, paper_data, fields)
+        if not PaperFieldsConfig.is_in_noraml_fields(fields):
+            return
+        await self.redis.set_paper(paper_id, paper_data)
+        # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
+        # 检查是否在ARQ worker环境中
+        if not skip_neo4j_enqueue:
+            await task_queue.enqueue_neo4j_merge(paper_data)
+        else:
+            await self.neo4j.merge_paper_full(paper_data)
+    async def _cache_normal_papers(self, paper_mapping: Dict[str, Dict],fields: Optional[str] = None,skip_neo4j_enqueue: bool = False) -> bool:
+        """缓存正常论文"""
+        if fields:
+            await self.redis.mset_paper(paper_mapping, fields, settings.cache_paper_ttl)
+        if not PaperFieldsConfig.is_in_noraml_fields(fields):
+            return
+        await self.redis.mset_paper(paper_mapping, None, settings.cache_paper_ttl)
+        for paper_id, paper_data in paper_mapping.items():
+            if not skip_neo4j_enqueue:
+                await task_queue.enqueue_neo4j_merge(paper_data)
+            else:
+                await self.neo4j.merge_paper_full(paper_data)
     async def _fetch_from_s2(self, paper_id: str, fields: Optional[str] = None, skip_neo4j_enqueue: bool = False) -> Dict[str, Any]:
         """从S2 API获取数据（主体全量 + 可选关系分页）
         
@@ -733,21 +772,9 @@ class CorePaperService:
                     fetch_citations=False,
                     fetch_references=True
                 )
-            # 3) 合并并写缓存
             full_data = {**body, **relations}
-            await self.redis.set_paper(paper_id, full_data, fields)
-           
-            logger.info(f"存储外部id映射关系: {paper_id}")
-            # 3.5) 存储外部ID映射关系
-            await self.external_mapping.batch_set_mappings(ExternalIds.from_dict(full_data.get('externalIds', {})), full_data.get('paperId'))
-            # 4) 异步写入Neo4j：主节点 + 别名 + 数据块 + （小规模）关系/计划
-            # 检查是否在ARQ worker环境中
-            if not skip_neo4j_enqueue:
-                await task_queue.enqueue_neo4j_merge(full_data)
-            else:
-                await self.neo4j.merge_paper_full(full_data)
+            await self._cache_normal_paper(paper_id, full_data, PaperFieldsConfig.normalize_fields(fields), skip_neo4j_enqueue)
             logger.info(f"从S2获取数据成功: {paper_id}")
-            self._format_response(full_data, fields)
             return self._format_response(full_data, fields)
         except HTTPException:
             # 标记失败，避免遗留processing状态导致后续408

@@ -112,7 +112,8 @@ async def search_papers(
 
 @router.post("/batch")
 async def get_papers_batch(
-    request: BatchRequest = Body(..., description="批量请求参数")
+    request: BatchRequest = Body(..., description="批量请求参数"),
+    disable_cache: bool = Query(False, description="是否禁用缓存，为true时直接从S2 API获取")
 ):
     """批量获取论文 - 实现缓存策略"""
     try:
@@ -121,7 +122,8 @@ async def get_papers_batch(
         
         batch_results = await core_paper_service.get_papers_batch(
             paper_ids=request.ids,
-            fields=request.fields
+            fields=request.fields,
+            disable_cache=disable_cache
         )
         
         return batch_results

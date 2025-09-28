@@ -197,7 +197,21 @@ class RedisClient:
         if fields:
             cache_key = f"paper:{paper_id}:{fields}"
         return await self.get(cache_key)
-    
+    async def mset_paper(self, paper_mapping: Dict[str, Dict], fields: Optional[str] = None, ttl: Optional[int] = None) -> bool:
+        """批量设置论文缓存"""
+        if fields:
+            logger.debug(f"批量设置论文缓存1: {fields}")
+            cache_mapping = {
+                f"paper:{paper_id}:{fields}": paper_data
+                for paper_id, paper_data in paper_mapping.items()
+            }
+        else:
+            logger.debug(f"批量设置论文缓存: full")
+            cache_mapping = {
+                CacheKeys.PAPER_FULL.format(paper_id=paper_id): paper_data
+                for paper_id, paper_data in paper_mapping.items()
+            }
+        return await self.mset(cache_mapping, ttl)
     async def set_paper(
         self, 
         paper_id: str, 

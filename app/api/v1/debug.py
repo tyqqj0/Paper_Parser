@@ -51,10 +51,32 @@ async def warm_paper_cache(
         logger.error(f"缓存预热失败 paper_id={paper_id}: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
+@router.get("/check_redis_cache")
+async def check_redis_cache():
+    """检查所有Redis缓存键"""
+    try:
+        # 若未连接Redis，返回空结果
+        if redis_client.redis is None:
+            return {"total": 0, "keys": []}
 
+        keys = []
+        # 使用scan迭代避免阻塞
+        async for key in redis_client.redis.scan_iter(match="*", count=500):
+            keys.append(key)
 
-@router.delete("/cache")
-async def clear_all_cache():
+        # 可选：排序，便于查看
+        try:
+            keys.sort()
+        except Exception:
+            pass
+
+        return {"total": len(keys), "keys": keys}
+    except Exception as e:
+        logger.error(f"检查Redis缓存失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
+
+@router.delete("/delte_redis_cache")
+async def clear_redis_cache():
     """清空所有Redis缓存（谨慎操作）"""
     try:
         # 使用按模式删除来避免需要FLUSHDB权限
@@ -63,4 +85,3 @@ async def clear_all_cache():
     except Exception as e:
         logger.error(f"清空所有缓存失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
-

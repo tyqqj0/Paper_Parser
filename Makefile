@@ -149,20 +149,20 @@ deploy: build up
 # 备份 Neo4j（冷备，短暂停机）
 backup-neo4j:
 	@echo "备份 Neo4j（冷备）..."
-	@mkdir -p /home/zhihui/code/parser2/backups/neo4j
+	@mkdir -p ../backups/neo4j
 	@docker compose stop neo4j
-	@docker run --rm \
+	@DATE=$$(date +%F_%H%M%S); \
+	docker run --rm \
 		--volumes-from paper_parser_neo4j \
-		-v /home/zhihui/code/parser2/backups/neo4j:/backups \
-		neo4j:5 bash -lc "mkdir -p /backups && /var/lib/neo4j/bin/neo4j-admin database dump --to-path=/backups neo4j"
-	@DATE=$$(date +%F_%H%M%S); cp -f /home/zhihui/code/parser2/backups/neo4j/neo4j.dump /home/zhihui/code/parser2/backups/neo4j/neo4j-$$DATE.dump
+		-v $$(pwd)/../backups/neo4j:/backups \
+		neo4j:5 bash -lc "mkdir -p /backups && rm -f /backups/neo4j.dump && /var/lib/neo4j/bin/neo4j-admin database dump --to-path=/backups neo4j && mv /backups/neo4j.dump /backups/neo4j-$$DATE.dump"
 	@docker compose start neo4j
 	@echo "Neo4j 冷备完成。"
 
 # 恢复 Neo4j（从指定 dump 文件或交互选择）
 restore-neo4j:
 	@bash -lc 'set -euo pipefail; \
-	BACKUP_DIR="/home/zhihui/code/parser2/backups/neo4j"; \
+	BACKUP_DIR="$$(pwd)/../backups/neo4j"; \
 	SELECTED="$(DUMP_FILE)"; \
 	if [ -z "$$SELECTED" ]; then \
 		mapfile -t files < <(ls -1t "$$BACKUP_DIR"/*.dump 2>/dev/null || true); \
@@ -195,11 +195,11 @@ restore-neo4j:
 # 备份 SQLite（external_id_mapping.db）
 backup-sqlite:
 	@echo "备份 SQLite（external_id_mapping.db）..."
-	@mkdir -p /home/zhihui/code/parser2/backups/sqlite
+	@mkdir -p ../backups/sqlite
 	@bash -lc 'set -euo pipefail; \
 	docker compose stop api arq-worker; \
-	BACKUP_DIR="/home/zhihui/code/parser2/backups/sqlite"; \
-	SRC_DB="/home/zhihui/code/parser2/Paper_Parser/data/external_id_mapping.db"; \
+	BACKUP_DIR="$$(pwd)/../backups/sqlite"; \
+	SRC_DB="data/external_id_mapping.db"; \
 	TS=$$(date +%F_%H%M%S); \
 	if command -v sqlite3 >/dev/null 2>&1; then \
 		sqlite3 "$$SRC_DB" ".backup '$$BACKUP_DIR/external_id_mapping-$$TS.db'"; \
@@ -214,8 +214,8 @@ backup-sqlite:
 restore-sqlite:
 	@bash -lc 'set -euo pipefail; \
 	docker compose stop api arq-worker; \
-	BACKUP_DIR="/home/zhihui/code/parser2/backups/sqlite"; \
-	TARGET_DB="/home/zhihui/code/parser2/Paper_Parser/data/external_id_mapping.db"; \
+	BACKUP_DIR="$$(pwd)/../backups/sqlite"; \
+	TARGET_DB="data/external_id_mapping.db"; \
 	SELECTED="$(DB_FILE)"; \
 	if [ -z "$$SELECTED" ]; then \
 		mapfile -t files < <(ls -1t "$$BACKUP_DIR"/external_id_mapping-*.db 2>/dev/null || ls -1t "$$BACKUP_DIR"/*.db 2>/dev/null || true); \
